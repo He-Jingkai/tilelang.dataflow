@@ -67,6 +67,8 @@ from tvm.tir.transform import prim_func_pass
 
 # Cache the Op for if_then_else to avoid repeated lookups
 _IF_THEN_ELSE_OP = Op.get("tir.if_then_else")
+_TL_PTX_CP_ASYNC_OP = Op.get("tl.ptx_cp_async")
+_TIR_PTX_CP_ASYNC_OP = Op.get("tir.ptx_cp_async")
 
 from tilelang.utils.language import is_fragment, is_global, is_local, is_local_var, is_shared
 
@@ -119,6 +121,11 @@ def _has_cast(stmt: Stmt) -> bool:
     finder = _CastFinder()
     finder.visit_stmt(stmt)
     return finder.found
+
+
+def is_cp_async_call(op: Call) -> bool:
+    """Return true for cp.async calls whose pointer args must stay opaque."""
+    return op.op.same_as(_TL_PTX_CP_ASYNC_OP) or op.op.same_as(_TIR_PTX_CP_ASYNC_OP)
 
 
 def _contains_seq_stmt(stmt: Stmt) -> bool:
@@ -192,6 +199,8 @@ class MemoryAccessCollector(PyStmtExprVisitor):
         # Skip indices traversal
 
     def visit_call_(self, op: Call) -> None:
+        if is_cp_async_call(op):
+            return
         if op.op.same_as(_IF_THEN_ELSE_OP):
             # Skip condition (args[0]), only visit true/false values
             self.visit_expr(op.args[1])
@@ -537,6 +546,14 @@ class AccessReplacer(tir.PyStmtExprMutator):
         if cast_buf is not None:
             return BufferLoad(cast_buf, [self.loop_var])
         return op
+
+    def visit_call_(self, op: Call) -> tir.PrimExpr:
+        if is_cp_async_call(op):
+            return op
+        new_args = [self.visit_expr(arg) for arg in op.args]
+        if all(new_arg.same_as(old_arg) for new_arg, old_arg in zip(new_args, op.args)):
+            return op
+        return Call(op.dtype, op.op, new_args, op.annotations, op.span)
 
 
 def DecoupleTypeCast():

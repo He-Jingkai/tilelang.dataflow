@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "../backend/cuda/op/copy.h"
 #include "../layout/layout.h"
 #include "../op/builtin.h"
 #include "../op/copy.h"
@@ -82,7 +83,10 @@ bool CheckPipelineManagedCPAsyncCopy(const CopyNode &op,
       !CheckTargetIndependentAsyncCopyPreconditions(op)) {
     return false;
   }
-  return !target.defined() || TargetHasAsyncCopy(target.value());
+  if (!target.defined()) {
+    return !op.transfer_contract.defined();
+  }
+  return cuda::IsPipelineManagedCPAsyncCopy(op, target.value());
 }
 
 bool ShapesEqual(const Array<PrimExpr> &lhs, const Array<PrimExpr> &rhs,
@@ -405,6 +409,12 @@ private:
     auto annotations = call->annotations;
     annotations.Set(attr::kAsyncCopyNoImplicitCommitWait,
                     IntImm(DataType::Int(32), 1));
+    auto tile_op = ParseOperator(call);
+    const auto *copy = tile_op.as<CopyNode>();
+    if (copy != nullptr && copy->transfer_contract.defined()) {
+      annotations.Set(kTransferPipelineSyncConsumed,
+                      IntImm(DataType::Int(32), 1));
+    }
     return Call(call->dtype, call->op, call->args, annotations, call->span);
   }
 
@@ -2370,6 +2380,12 @@ public:
       auto new_annotations = call->annotations;
       new_annotations.Set("barrier", MakeBarrierRef(barrier_buf_, barrier_id_));
       new_annotations.Set("is_tma_copy", IntImm(DataType::Int(32), 1));
+      auto tile_op = ParseOperator(call);
+      if (const auto *copy = tile_op.as<CopyNode>();
+          copy != nullptr && copy->transfer_contract.defined()) {
+        new_annotations.Set(kTransferPipelineSyncConsumed,
+                            IntImm(DataType::Int(32), 1));
+      }
       new_annotations.Set("emit_arrive",
                           IntImm(DataType::Int(32), emit_arrive_ ? 1 : 0));
       return Call(call->dtype, tma_copy_op, call->args, new_annotations,

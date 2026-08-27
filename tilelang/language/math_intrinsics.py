@@ -333,6 +333,13 @@ def ieee_fdiv(x: PrimExpr, y: PrimExpr, rounding_mode="rn") -> PrimExpr:
     return tir.call_intrin(x.dtype, tir.op.Op.get("tl.ieee_fdiv"), x, y, rounding_mode)
 
 
+def fast_fdiv(x: PrimExpr, y: PrimExpr) -> PrimExpr:
+    """Fast float32 division using CUDA __fdividef on CUDA codegen."""
+    x = tir.convert(x)
+    y = tir.convert(y)
+    return tir.call_intrin(x.dtype, tir.op.Op.get("tl.fast_fdiv"), x, y)
+
+
 _PACKED_X2_DTYPES = frozenset({"float32x2", "bfloat16x2", "float16x2"})
 
 
@@ -428,6 +435,7 @@ __all__ = [
     "ieee_fsqrt",  # noqa: F401
     "ieee_frsqrt",  # noqa: F401
     "ieee_fdiv",  # noqa: F401
+    "fast_fdiv",  # noqa: F401
     "add2",  # noqa: F401
     "sub2",  # noqa: F401
     "mul2",  # noqa: F401

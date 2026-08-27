@@ -50,6 +50,21 @@ struct Gemm {
     (void)gemm_inst;
     return "scalar";
   }
+
+  static GemmLoweringPlan ResolveLowering(const GemmNode &op,
+                                          const GemmLoweringContext &context) {
+    (void)context;
+    Array<Integer> shape = {Integer(op.logical_m()), Integer(op.logical_n()),
+                            Integer(op.logical_k())};
+    if (op.isWgmma_ || op.isTcgen05_) {
+      return MakeGemmLoweringPlan(
+          "cpu.scalar.sync", false, true, shape, shape, false, false, {}, 0, 0,
+          0, "explicit target-specific GEMM is unavailable on CPU");
+    }
+    return MakeGemmLoweringPlan("cpu.scalar.sync", true, true, shape, shape,
+                                false, op.m_ != op.logical_m(), {}, 0, 0, 0,
+                                "CPU scalar GEMM preserves the logical shape");
+  }
 };
 
 } // namespace cpu
@@ -66,6 +81,7 @@ bool RegisterCPUGemm() {
       cpu::Gemm::ComputeWarpPartition,
       cpu::Gemm::ReuseExistingSharedLayout,
       cpu::Gemm::InstructionKind,
+      cpu::Gemm::ResolveLowering,
   });
   return true;
 }

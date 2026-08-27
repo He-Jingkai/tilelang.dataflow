@@ -46,9 +46,78 @@ TL_DEVICE void tma_load_multicast(void *smem_ptr, void *gmem_ptr,
       :);
 }
 
+// Destination-driven DSM copy. Participating threads cooperatively load from
+// one cluster peer and stage the bytes in the calling CTA's shared memory.
+// Unlike cp.async.bulk, Hopper has no remote-source bulk-copy instruction, so
+// this path uses vector DSM loads and local shared stores.
+TL_DEVICE void cluster_pull(void *dst, const void *src, int src_cta,
+                            uint32_t size_bytes, uint32_t thread_start,
+                            uint32_t thread_count) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  uint32_t thread_rank = static_cast<uint32_t>(threadIdx.x);
+  if (thread_count == 0u || thread_rank < thread_start ||
+      thread_rank >= thread_start + thread_count) {
+    return;
+  }
+
+  uint32_t local_rank = thread_rank - thread_start;
+  uint32_t src_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(src));
+  uint32_t dst_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+  uint32_t remote_src;
+  asm volatile("mapa.shared::cluster.u32 %0, %1, %2;\n"
+               : "=r"(remote_src)
+               : "r"(src_ptr), "r"(src_cta));
+
+  bool vector_aligned = ((src_ptr | dst_ptr | size_bytes) & 0xfu) == 0u;
+  if (vector_aligned) {
+    for (uint32_t offset = local_rank << 4; offset < size_bytes;
+         offset += thread_count << 4) {
+      uint32_t x0, x1, x2, x3;
+      uint32_t remote_addr = remote_src + offset;
+      uint32_t local_addr = dst_ptr + offset;
+      asm volatile("ld.shared::cluster.v4.b32 {%0, %1, %2, %3}, [%4];\n"
+                   : "=r"(x0), "=r"(x1), "=r"(x2), "=r"(x3)
+                   : "r"(remote_addr)
+                   : "memory");
+      asm volatile("st.shared::cta.v4.b32 [%0], {%1, %2, %3, %4};\n"
+                   :
+                   : "r"(local_addr), "r"(x0), "r"(x1), "r"(x2), "r"(x3)
+                   : "memory");
+    }
+  } else {
+    for (uint32_t offset = local_rank; offset < size_bytes;
+         offset += thread_count) {
+      uint32_t value;
+      uint32_t remote_addr = remote_src + offset;
+      uint32_t local_addr = dst_ptr + offset;
+      asm volatile("ld.shared::cluster.u8 %0, [%1];\n"
+                   : "=r"(value)
+                   : "r"(remote_addr)
+                   : "memory");
+      asm volatile("st.shared::cta.u8 [%0], %1;\n"
+                   :
+                   : "r"(local_addr), "r"(value)
+                   : "memory");
+    }
+  }
+
+  // WGMMA reads shared memory through the async proxy. Each producer thread
+  // fences its own generic shared stores before arriving at the ready barrier.
+  asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+#else
+  (void)dst;
+  (void)src;
+  (void)src_cta;
+  (void)size_bytes;
+  (void)thread_start;
+  (void)thread_count;
+  TILELANG_UNREACHABLE("Cluster pull requires sm90+");
+#endif
+}
+
 // Generic SM-to-SM async bulk copy via cp.async.bulk.shared::cluster
 template <typename BarrierType = uint64_t>
-TL_DEVICE void tma_store_cluster(void *dst, void *src, int dst_cta,
+TL_DEVICE void tma_store_cluster(void *dst, const void *src, int dst_cta,
                                  uint32_t size_bytes, BarrierType &bar) {
   uint32_t mbarrier_ptr = static_cast<uint32_t>(
       __cvta_generic_to_shared(reinterpret_cast<uint64_t *>(&bar)));

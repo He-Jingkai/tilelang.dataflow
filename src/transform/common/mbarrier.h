@@ -27,6 +27,15 @@ inline Buffer CreateMBarrierBuffer(const std::string &name, int num_barriers) {
                 0, 0, kDefault);
 }
 
+inline Buffer CreateClusterMBarrierBuffer(const std::string &name,
+                                          int num_barriers) {
+  Var data(name,
+           PointerType(PrimType(DataType::UInt(64)), "shared.cluster_barrier"));
+  return Buffer(data, DataType::UInt(64),
+                {IntImm(DataType::Int(32), num_barriers)}, {}, PrimExpr(), name,
+                0, 0, kDefault);
+}
+
 /*!
  * \brief Create a BufferLoad reference to a specific barrier slot.
  *

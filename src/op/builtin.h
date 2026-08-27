@@ -44,7 +44,15 @@ static constexpr const char *kAsyncCopyNoImplicitCommitWait =
 // parity from surrounding loop context.
 static constexpr const char *kPipelineMbarPhaseExpr =
     "tl.pipeline_mbar_phase_expr";
+// Access-pointer annotation: the offset is already in the physical/remapped
+// storage layout and must not be transformed again by LowerTileOp.
+static constexpr const char *kPhysicalOffsetAccessPtr =
+    "tl.physical_offset_access_ptr";
 static constexpr const char *kLocalVarInit = "tl.local_var_init";
+// Compiler-generated fill may request a predicated thread partition when the
+// logical region does not divide the final thread extent.
+static constexpr const char *kPredicatedFillPartition =
+    "tl.predicated_fill_partition";
 // A PrimFunc-level attribute carrying a list of handle Vars
 // that must NOT be marked with the restrict qualifier in codegen.
 // Type: Array<tir::Var>
@@ -103,6 +111,10 @@ static constexpr const char *kEnableAsyncCopy = "tl.enable_async_copy";
 static constexpr const char *kEnableVectorizePlannerVerbose =
     "tl.enable_vectorize_planner_verbose";
 static constexpr const char *kDisableWGMMA = "tl.disable_wgmma";
+static constexpr const char *kDisableLogicalGemmPadding =
+    "tl.disable_logical_gemm_padding";
+static constexpr const char *kLogicalGemmMaxSharedMemoryBytes =
+    "tl.logical_gemm_max_shared_memory_bytes";
 static constexpr const char *kDisableShuffleElect = "tl.disable_shuffle_elect";
 static constexpr const char *kDisableLoopUnswitching =
     "tl.disable_loop_unswitching";
@@ -229,6 +241,8 @@ TVM_DLL const Op &__tan();
 TVM_DLL const Op &__cos();
 // __sin(x) - fast sine
 TVM_DLL const Op &__sin();
+// fast_fdiv(x, y) - fast float32 division using CUDA __fdividef
+TVM_DLL const Op &fast_fdiv();
 // max_nan(x, y) - max with CUDA __hmax_nan semantics for fp16/bf16
 TVM_DLL const Op &max_nan();
 // min_nan(x, y) - min with CUDA __hmin_nan semantics for fp16/bf16
@@ -653,12 +667,29 @@ TVM_DLL const Op &cluster_wait();
 TVM_DLL const Op &cluster_sync();
 
 /*!
+ * \brief Cooperatively pull bytes from a peer CTA's DSM into local shared
+ * memory.
+ *
+ * cluster_pull(dst, src, src_rank, size_bytes, thread_start, thread_count)
+ *
+ */
+TVM_DLL const Op &cluster_pull();
+
+/*!
  * \brief Return the 1-D rank of the calling CTA within its cluster
  *
  * int block_rank_in_cluster()
  *
  */
 TVM_DLL const Op &block_rank_in_cluster();
+
+/*!
+ * \brief Return the physical SM id of the calling CTA/thread
+ *
+ * int smid()
+ *
+ */
+TVM_DLL const Op &smid();
 
 /*!
  * \brief Issue a Blackwell cluster launch control query that writes a 16-byte

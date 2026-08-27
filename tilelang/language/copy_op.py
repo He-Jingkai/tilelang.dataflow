@@ -1,14 +1,119 @@
 """Copy operations exposed on the TileLang language surface."""
 
 from __future__ import annotations
-from typing import Literal, Any
+
+from enum import IntEnum
+from typing import Any, Literal
+
 from tilelang._typing import BufferLikeType
-from tilelang.utils.language import (
-    to_buffer_region,
-    legalize_pairwise_extents,
-)
 from tilelang.language.utils import get_extent
+from tilelang.utils.language import (
+    legalize_pairwise_extents,
+    to_buffer_region,
+)
 from tvm import ir, tir
+
+
+class TransferSynchronizationOwner(IntEnum):
+    """Owner responsible for making an asynchronously issued transfer visible."""
+
+    TRANSFER = 0
+    PIPELINE = 1
+    CALLER = 2
+
+
+_TRANSFER_OWNER_BY_NAME = {
+    "transfer": TransferSynchronizationOwner.TRANSFER,
+    "pipeline": TransferSynchronizationOwner.PIPELINE,
+    "caller": TransferSynchronizationOwner.CALLER,
+}
+_UNSET = object()
+
+
+def is_region_call(value: Any) -> bool:
+    return isinstance(value, tir.Call) and isinstance(value.op, ir.Op) and value.op.name == "tl.tileop.region"
+
+
+def region_call_extents(value: Any):
+    if is_region_call(value):
+        return list(value.args[2:])
+    return get_extent(value)
+
+
+def encode_region(value: Any, *, access_type: str, extents: list[Any]):
+    if is_region_call(value):
+        return value
+    return to_buffer_region(value, access_type=access_type, extents=extents)
+
+
+def normalize_transfer_owner(
+    owner: str | int | TransferSynchronizationOwner,
+) -> TransferSynchronizationOwner:
+    if isinstance(owner, str):
+        try:
+            return _TRANSFER_OWNER_BY_NAME[owner]
+        except KeyError as err:
+            expected = ", ".join(sorted(_TRANSFER_OWNER_BY_NAME))
+            raise ValueError(f"synchronization_owner must be one of {expected}, got {owner!r}") from err
+    if isinstance(owner, bool):
+        raise TypeError("synchronization_owner cannot be a bool")
+    try:
+        return TransferSynchronizationOwner(owner)
+    except (TypeError, ValueError) as err:
+        raise ValueError(f"invalid synchronization_owner {owner!r}") from err
+
+
+def transfer_contract(
+    valid_region: BufferLikeType,
+    oob_fill: Any = 0,
+    allow_async: bool = True,
+    synchronization_owner: str | int | TransferSynchronizationOwner = "transfer",
+) -> tir.Call:
+    """Create a target-independent bounded-transfer contract.
+
+    ``valid_region`` is an absolute rectangular region of the source buffer.
+    Source coordinates outside that region produce ``oob_fill``. The contract
+    records whether asynchronous execution is permitted and which layer owns
+    completion; it does not select a target instruction.
+    """
+
+    valid_extents = region_call_extents(valid_region)
+    if valid_extents is None:
+        raise TypeError("valid_region must carry an explicit rectangular extent")
+    if is_region_call(valid_region):
+        access_mask = valid_region.args[1]
+        if not isinstance(access_mask, tir.IntImm) or access_mask.value != 1:
+            raise ValueError("valid_region must use read access")
+    if not isinstance(allow_async, bool):
+        raise TypeError(f"allow_async must be a bool, got {allow_async!r}")
+    owner = normalize_transfer_owner(synchronization_owner)
+    if not allow_async and owner is not TransferSynchronizationOwner.TRANSFER:
+        raise ValueError("a transfer that disallows asynchronous execution must own its synchronization")
+    if not isinstance(oob_fill, tir.PrimExpr):
+        if not isinstance(oob_fill, (bool, int, float)):
+            raise TypeError(f"oob_fill must be a scalar value, got {oob_fill!r}")
+        oob_fill = tir.const(oob_fill)
+    fill_buffer_loads = []
+    tir.stmt_functor.post_order_visit(
+        oob_fill,
+        lambda node: fill_buffer_loads.append(node) if isinstance(node, tir.BufferLoad) else None,
+    )
+    if fill_buffer_loads:
+        raise ValueError("oob_fill cannot read a buffer; pass a constant or scalar parameter")
+
+    encoded_valid_region = encode_region(
+        valid_region,
+        access_type="r",
+        extents=list(valid_extents),
+    )
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.transfer_contract"),
+        encoded_valid_region,
+        oob_fill,
+        int(allow_async),
+        int(owner),
+    )
 
 
 def _normalize_copy_regions(
@@ -21,8 +126,8 @@ def _normalize_copy_regions(
     if isinstance(src, tir.Buffer) and isinstance(dst, tir.Buffer):
         ir.assert_structural_equal(src.shape, dst.shape)
 
-    src_extent = get_extent(src)
-    dst_extent = get_extent(dst)
+    src_extent = region_call_extents(src)
+    dst_extent = region_call_extents(dst)
 
     src_is_scalar_load = src_extent is None and isinstance(src, tir.BufferLoad)
     dst_is_scalar_load = dst_extent is None and isinstance(dst, tir.BufferLoad)
@@ -43,15 +148,20 @@ def _normalize_copy_regions(
     src_extent, dst_extent = legalize_pairwise_extents(src_extent, dst_extent)
 
     # Use legalized extents for src and dst respectively.
-    src = to_buffer_region(src, access_type="r", extents=src_extent)
-    dst = to_buffer_region(dst, access_type="w", extents=dst_extent)
+    src = encode_region(src, access_type="r", extents=src_extent)
+    dst = encode_region(dst, access_type="w", extents=dst_extent)
     return src, dst
 
 
 def copy(
     src: BufferLikeType,
     dst: BufferLikeType,
+    contract: tir.Call | None = None,
     *,
+    valid_region: BufferLikeType | None = None,
+    oob_fill: Any = _UNSET,
+    allow_async: bool | None = None,
+    synchronization_owner: str | int | TransferSynchronizationOwner | None = None,
     coalesced_width: int | None = None,
     disable_tma: bool = False,
     eviction_policy: Literal["evict_normal", "evict_first", "evict_last"] | None = None,
@@ -63,6 +173,16 @@ def copy(
     Args:
         src (Union[tir.Buffer, tir.BufferLoad, tir.BufferRegion]): Source memory region
         dst (Union[tir.Buffer, tir.BufferLoad, tir.BufferRegion]): Destination memory region
+        contract (Optional[tir.Call]): Pre-built ``T.transfer_contract``. The positional
+            form exists so printed TileLang IR can round-trip.
+        valid_region (Optional[BufferLikeType], keyword-only): Absolute valid source
+            region for an opt-in bounded transfer.
+        oob_fill (Optional[scalar], keyword-only): Value written for source coordinates
+            outside ``valid_region``. Defaults to zero when ``valid_region`` is set.
+        allow_async (Optional[bool], keyword-only): Whether an implementation may issue
+            the transfer asynchronously. Defaults to True for a bounded transfer.
+        synchronization_owner (Optional[str], keyword-only): ``transfer``, ``pipeline``,
+            or ``caller``. Defaults to ``transfer``.
         coalesced_width (Optional[int], keyword-only): Width for coalesced memory access. Defaults to None.
         disable_tma (bool, keyword-only): Whether to disable TMA acceleration. Defaults to False.
         eviction_policy (Optional[str], keyword-only): Cache eviction policy. Defaults to None.
@@ -99,7 +219,32 @@ def copy(
     """
     src, dst = _normalize_copy_regions(src, dst)
     if isinstance(src, tir.BufferLoad) and isinstance(dst, tir.BufferLoad):
+        if (
+            contract is not None
+            or valid_region is not None
+            or oob_fill is not _UNSET
+            or allow_async is not None
+            or synchronization_owner is not None
+        ):
+            raise ValueError("scalar copy does not accept a transfer contract")
         return tir.BufferStore(dst.buffer, src, dst.indices)
+
+    if contract is not None and valid_region is not None:
+        raise ValueError("provide either contract or valid_region, not both")
+    if contract is None and valid_region is not None:
+        contract = transfer_contract(
+            valid_region,
+            0 if oob_fill is _UNSET else oob_fill,
+            True if allow_async is None else allow_async,
+            "transfer" if synchronization_owner is None else synchronization_owner,
+        )
+    elif contract is None and (oob_fill is not _UNSET or allow_async is not None or synchronization_owner is not None):
+        raise ValueError("oob_fill, allow_async, and synchronization_owner require valid_region")
+    elif contract is not None:
+        if not (isinstance(contract, tir.Call) and isinstance(contract.op, ir.Op) and contract.op.name == "tl.transfer_contract"):
+            raise TypeError("contract must be produced by T.transfer_contract")
+        if oob_fill is not _UNSET or allow_async is not None or synchronization_owner is not None:
+            raise ValueError("contract cannot be combined with transfer convenience arguments")
 
     # Build annotations dict
     ann = annotations.copy() if annotations else {}
@@ -117,7 +262,15 @@ def copy(
     if loop_layout is not None and "parallel_loop_layout" not in ann:
         ann["parallel_loop_layout"] = loop_layout
 
-    return tir.call_intrin("handle", tir.op.Op.get("tl.tileop.copy"), src, dst, annotations=ann if ann else None)
+    args = [src, dst]
+    if contract is not None:
+        args.append(contract)
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.tileop.copy"),
+        *args,
+        annotations=ann if ann else None,
+    )
 
 
 def copy_cluster(
@@ -127,6 +280,7 @@ def copy_cluster(
     dst_block: int | tir.PrimExpr | None = None,
     cluster_mask: int | None = None,
     remote_barrier: tir.BufferLoad | None = None,
+    leader_thread_extent: int | None = None,
     eviction_policy: Literal["evict_normal", "evict_first", "evict_last"] | None = None,
     coalesced_width: int | None = None,
     loop_layout: Any | None = None,
@@ -141,6 +295,10 @@ def copy_cluster(
         remote_barrier: Shared-memory mbarrier for asynchronous SM-to-SM copy
             completion signalling.  The destination CTA should wait on its
             local copy of this barrier.
+        leader_thread_extent: Logical thread-group size used to elect the lane
+            that issues a bulk SM-to-SM copy. Defaults to the kernel's lowering
+            thread extent. Use 128 when issuing from a dedicated producer warp
+            group. This does not affect the cooperative SIMT fallback.
         eviction_policy: Cache eviction hint passed to the TMA instruction.
             Only relevant for the TMA multicast path (``cluster_mask`` set).
         coalesced_width: Vectorization width (in elements) for the SIMT loop
@@ -162,6 +320,12 @@ def copy_cluster(
         ann["cluster_mask"] = cluster_mask
     if remote_barrier is not None:
         ann["barrier"] = remote_barrier
+    if leader_thread_extent is not None:
+        if not isinstance(leader_thread_extent, int):
+            raise TypeError(f"leader_thread_extent must be an int or None, got {type(leader_thread_extent).__name__}")
+        if leader_thread_extent != 0 and (leader_thread_extent < 32 or leader_thread_extent % 32 != 0):
+            raise ValueError(f"leader_thread_extent must be 0 or a positive multiple of 32, got {leader_thread_extent}")
+        ann["leader_thread_extent"] = leader_thread_extent
     if eviction_policy is not None:
         eviction_policy_map = {"evict_normal": 0, "evict_first": 1, "evict_last": 2}
         ann["eviction_policy"] = eviction_policy_map[eviction_policy]
@@ -178,6 +342,8 @@ def async_copy(
     dst: BufferLikeType,
     *,
     coalesced_width: int | None = None,
+    src_upper_bounds: dict[int, Any] | None = None,
+    assume_src_in_bounds: bool = False,
     annotations: dict | None = None,
     loop_layout: Any | None = None,
 ) -> tir.PrimExpr | tir.Stmt:
@@ -192,6 +358,10 @@ def async_copy(
         src (Union[tir.Buffer, tir.BufferLoad, tir.BufferRegion]): Source memory region
         dst (Union[tir.Buffer, tir.BufferLoad, tir.BufferRegion]): Destination memory region
         coalesced_width (Optional[int], keyword-only): Width for coalesced memory access. Defaults to None.
+        src_upper_bounds (Optional[dict[int, PrimExpr]], keyword-only): Per-source-axis dynamic
+            absolute upper bounds used to form the cp.async zero-fill predicate.
+        assume_src_in_bounds (bool, keyword-only): Skip source bounds checks for copies whose source
+            region is known to be in-bounds. The caller is responsible for keeping this true.
         annotations (Optional[dict], keyword-only): Additional annotations dict.
         loop_layout (Optional[Fragment], keyword-only): A parallel loop layout hint for the SIMT copy loop.
 
@@ -205,6 +375,15 @@ def async_copy(
     ann = annotations.copy() if annotations else {}
     if "coalesced_width" not in ann and coalesced_width is not None:
         ann["coalesced_width"] = coalesced_width
+    if src_upper_bounds:
+        for axis, bound in src_upper_bounds.items():
+            if not isinstance(axis, int):
+                raise TypeError(f"src_upper_bounds axis must be int, got {type(axis).__name__}")
+            if axis < 0:
+                raise ValueError(f"src_upper_bounds axis must be non-negative, got {axis}")
+            ann[f"src_upper_bound_{axis}"] = bound if isinstance(bound, tir.PrimExpr) else tir.const(bound, "int32")
+    if assume_src_in_bounds:
+        ann["assume_src_in_bounds"] = 1
     if loop_layout is not None and "parallel_loop_layout" not in ann:
         ann["parallel_loop_layout"] = loop_layout
 
@@ -222,12 +401,14 @@ def tma_copy(
     dst: BufferLikeType,
     *,
     barrier=None,
+    expect_transaction: bool = True,
+    leader_thread_extent: int | None = None,
     eviction_policy: Literal["evict_normal", "evict_first", "evict_last"] | None = None,
     annotations: dict | None = None,
 ) -> tir.PrimExpr | tir.Stmt:
     """TMA copy with user-managed synchronization.
 
-    For **loads** (global -> shared): issues expect_tx + tma_load (no wait).
+    For **loads** (global -> shared): issues expect_tx + tma_load (no wait) by default.
     Unlike T.copy() which emits a full synchronous TMA sequence (arrive + load + wait),
     T.tma_copy() emits only the producer part (expect_tx + tma_load).
     The user manages synchronization explicitly via T.barrier_arrive() and
@@ -245,6 +426,12 @@ def tma_copy(
             Required for loads (global -> shared). Not needed for stores.
             The TMA load will arrive at this barrier with expected byte count.
             The user must wait on the same barrier via T.mbarrier_wait_parity().
+        expect_transaction: Whether a load should emit ``mbarrier.expect_tx``
+            immediately before the TMA instruction. Set this to ``False`` only
+            when the caller has already armed the same barrier explicitly.
+        leader_thread_extent: Logical thread-group size used to elect the lane
+            that issues the TMA instruction. Defaults to the kernel's lowering
+            thread extent. Use 32 for a dedicated single-warp TMA producer.
         eviction_policy: Cache eviction policy. Defaults to None.
         annotations: Additional annotations dict. Values in annotations take
             precedence over individual arguments.
@@ -274,6 +461,16 @@ def tma_copy(
         from .builtin import _mbar_to_buffer_load
 
         ann["barrier"] = _mbar_to_buffer_load(barrier)
+
+    if not expect_transaction and "skip_expect_transaction" not in ann:
+        ann["skip_expect_transaction"] = 1
+
+    if leader_thread_extent is not None and "leader_thread_extent" not in ann:
+        if not isinstance(leader_thread_extent, int):
+            raise TypeError(f"leader_thread_extent must be an int or None, got {type(leader_thread_extent).__name__}")
+        if leader_thread_extent != 0 and (leader_thread_extent < 32 or leader_thread_extent % 32 != 0):
+            raise ValueError(f"leader_thread_extent must be 0 or a positive multiple of 32, got {leader_thread_extent}")
+        ann["leader_thread_extent"] = leader_thread_extent
 
     if "eviction_policy" not in ann and eviction_policy is not None:
         eviction_policy_map = {"evict_normal": 0, "evict_first": 1, "evict_last": 2}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 from tvm import tir, IRModule
+from tvm import ir as tvm_ir
 from tvm.target import Target
 import tilelang
 from tilelang.transform import PassContext
@@ -78,6 +79,193 @@ def should_enable_race_check(pass_ctx: PassContext | None = None) -> bool:
         pass_ctx = tilelang.transform.get_pass_context()
     enabled = not pass_ctx.config.get(tilelang.PassConfigKey.TL_DISABLE_DATA_RACE_CHECK, False)
     return enabled
+
+
+def slice_handoff_layout_for_single_stage(layout, logical_shape):
+    """Remove leading pipeline-stage dimensions from a handoff layout."""
+
+    from tilelang.layout import Layout
+
+    input_shape = list(layout.get_input_shape())
+    logical_shape = list(logical_shape)
+    leading = len(input_shape) - len(logical_shape)
+    if leading < 0 or input_shape[leading:] != logical_shape:
+        raise RuntimeError("handoff consumer layout does not match its logical transfer shape")
+    if leading == 0:
+        return layout
+
+    # Fragment layouts prepend their optional replication variable to the
+    # logical input variables returned here.  The actual layout inputs are
+    # therefore the trailing ``len(input_shape)`` entries, not the entire
+    # forward-var array.
+    old_vars = list(layout.get_forward_vars())
+    old_forward = list(layout.get_forward_index())
+    if len(old_vars) < len(input_shape) or len(old_forward) < leading:
+        raise RuntimeError("handoff consumer layout cannot be sliced by stage")
+    input_vars = old_vars[-len(input_shape) :] if input_shape else []
+    auxiliary_vars = old_vars[: len(old_vars) - len(input_vars)]
+
+    def forward(*new_vars):
+        substitution = {input_vars[index]: tir.IntImm("int32", 0) for index in range(leading)}
+        substitution.update({input_vars[leading + index]: var for index, var in enumerate(new_vars)})
+        mapped = [tir.stmt_functor.substitute(expr, substitution) for expr in old_forward[leading:]]
+        for expr in mapped:
+            undefined = tir.analysis.undefined_vars(expr, list(new_vars))
+            if any(var.same_as(auxiliary) for var in undefined for auxiliary in auxiliary_vars):
+                raise RuntimeError("handoff consumer layout index depends on a fragment replication variable and cannot be sliced by stage")
+        return mapped
+
+    return Layout(logical_shape, forward)
+
+
+def bind_cross_handler_handoff_layouts(mod: IRModule) -> IRModule:
+    """Bind producer arena views to the consumer's inferred single-stage layout."""
+
+    from tilelang import _ffi_api
+
+    fingerprint_attr = "tl.cross_handler_handoff_plan_fingerprint"
+    consumer_transfer_attr = "tl.cross_handler_handoff_transfer_index"
+    producer_transfer_attr = "tl.cross_handler_handoff_producer_transfer"
+    role_attr = "tl.cross_handler_handoff_role"
+
+    def string_value(value) -> str:
+        return str(getattr(value, "value", value))
+
+    def copy_buffer_by_transfer(func, annotation_name):
+        result = {}
+
+        def visit(node):
+            if not (
+                isinstance(node, tir.Call) and isinstance(node.op, tvm_ir.Op) and node.op.name in {"tl.tileop.copy", "tl.tileop.tma_copy"}
+            ):
+                return
+            transfer = node.annotations.get(annotation_name)
+            if transfer is None:
+                return
+            parsed = _ffi_api.ParseOperator(node)
+            buffers = result.setdefault(int(transfer), [])
+            if not any(parsed.dst.data.same_as(item.data) for item in buffers):
+                buffers.append(parsed.dst)
+
+        tir.stmt_functor.post_order_visit(func.body, visit)
+        return result
+
+    def layout_for_data(func, data):
+        found = []
+
+        def visit(node):
+            if not isinstance(node, tir.Block):
+                return
+            layout_map = node.annotations.get("layout_map")
+            if layout_map is None:
+                return
+            for key, layout in layout_map.items():
+                key_data = key.data if isinstance(key, tir.Buffer) else key
+                if isinstance(key_data, tir.Var) and key_data.same_as(data):
+                    found.append(layout)
+
+        tir.stmt_functor.post_order_visit(func.body, visit)
+        if not found:
+            raise RuntimeError("handoff consumer buffer lacks an inferred layout")
+        first = found[0]
+        if any(not tvm_ir.structural_equal(first, item) for item in found[1:]):
+            raise RuntimeError("handoff consumer buffer has conflicting inferred layouts")
+        return first
+
+    consumer_layouts = {}
+    for _, func in mod.functions.items():
+        if not isinstance(func, tir.PrimFunc) or not func.attrs:
+            continue
+        if string_value(func.attrs.get(role_attr, "")) != "consumer":
+            continue
+        fingerprint = string_value(func.attrs.get(fingerprint_attr, ""))
+        if not fingerprint:
+            continue
+        for transfer, buffers in copy_buffer_by_transfer(
+            func,
+            consumer_transfer_attr,
+        ).items():
+            if len(buffers) != 1:
+                raise RuntimeError("handoff consumer transfer must target one buffer")
+            buffer = buffers[0]
+            layout = layout_for_data(func, buffer.data)
+            key = (fingerprint, transfer)
+            previous = consumer_layouts.get(key)
+            if previous is not None and not tvm_ir.structural_equal(previous, layout):
+                raise RuntimeError(f"handoff consumer variants infer conflicting layouts for transfer {transfer}")
+            consumer_layouts[key] = layout
+
+    updates = {}
+    for global_var, func in mod.functions.items():
+        if not isinstance(func, tir.PrimFunc) or not func.attrs:
+            continue
+        if string_value(func.attrs.get(role_attr, "")) != "producer":
+            continue
+        fingerprint = string_value(func.attrs.get(fingerprint_attr, ""))
+        producer_buffers = copy_buffer_by_transfer(func, producer_transfer_attr)
+        if not producer_buffers:
+            continue
+        layouts = []
+        for transfer, buffers in producer_buffers.items():
+            consumer_key = (fingerprint, transfer)
+            if consumer_key not in consumer_layouts:
+                raise RuntimeError(f"handoff producer transfer has no matching consumer layout: transfer={transfer}")
+            for buffer in buffers:
+                layouts.append(
+                    (
+                        buffer,
+                        slice_handoff_layout_for_single_stage(
+                            consumer_layouts[consumer_key],
+                            buffer.shape,
+                        ),
+                    )
+                )
+
+        def rewrite(node, layouts=tuple(layouts)):
+            if not isinstance(node, tir.Block):
+                return node
+            if "layout_map" not in node.annotations:
+                return node
+            annotations = dict(node.annotations)
+            layout_map = dict(annotations.get("layout_map", {}))
+            bound_data = []
+            for key in tuple(layout_map):
+                key_data = key.data if isinstance(key, tir.Buffer) else key
+                if not isinstance(key_data, tir.Var):
+                    continue
+                for buffer, layout in layouts:
+                    data = buffer.data
+                    if key_data.same_as(data):
+                        layout_map[key] = layout
+                        if not any(item.same_as(data) for item in bound_data):
+                            bound_data.append(data)
+            for buffer, layout in layouts:
+                if not any(data.same_as(buffer.data) for data in bound_data):
+                    layout_map[buffer] = layout
+            annotations["layout_map"] = layout_map
+            return tir.Block(
+                node.iter_vars,
+                node.reads,
+                node.writes,
+                node.name_hint,
+                node.body,
+                node.init,
+                node.alloc_buffers,
+                node.match_buffers,
+                annotations,
+                getattr(node, "span", None),
+            )
+
+        body = tir.stmt_functor.ir_transform(
+            func.body,
+            None,
+            rewrite,
+            ["tir.Block"],
+        )
+        updates[global_var] = func.with_body(body)
+    if updates:
+        mod.update(IRModule(updates))
+    return mod
 
 
 def should_enable_prelower_semantic_check(pass_ctx: PassContext | None = None) -> bool:
@@ -179,6 +367,9 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.InjectAssumes()(mod)
     # Simplify the IR expressions
     mod = tilelang.transform.Simplify()(mod)
+    # Resolve logical GEMM implementations and materialize any compiler-owned
+    # physical padding before pipeline and layout transforms inspect shapes.
+    mod = tilelang.transform.MaterializeLogicalGemm()(mod)
     # Set layouts for reducers
     mod = tilelang.transform.LayoutReducer()(mod)
     # Tile-level warp specialization: runs before layout inference so that
@@ -199,6 +390,7 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.Simplify()(mod)
     # Infer memory layouts for fragments and shared memory
     mod = tilelang.transform.LayoutInference()(mod)
+    mod = bind_cross_handler_handoff_layouts(mod)
     # Visualize the layout
     LayoutVisual(mod)
     # Lower high-level tile operations to low-level operations

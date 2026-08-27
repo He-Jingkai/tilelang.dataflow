@@ -127,3 +127,6 @@ maint/host_checks/logs/*
 
 # uv Lockfile
 uv.lock
+
+# Generated Dataflow benchmark outputs
+schedule_res/

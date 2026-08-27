@@ -253,6 +253,13 @@ public:
         RemapBufferRewriter::Substitute(fptr->body, substituter.buffer_remap_);
     fptr->body =
         LayoutRemapRewriter::Substitute(fptr->body, substituter.layout_remap_);
+    Map<Var, Buffer> remapped_buffer_map;
+    for (const auto &[param_var, buffer] : fptr->buffer_map) {
+      remapped_buffer_map.Set(param_var, substituter.buffer_remap_.count(buffer)
+                                             ? substituter.buffer_remap_[buffer]
+                                             : buffer);
+    }
+    fptr->buffer_map = std::move(remapped_buffer_map);
     // Record whether TMA was actually used as a PrimFunc attribute so that
     // later phases (OptimizeForTarget) can choose the right pass pipeline
     // without relying on pass-context side-channel mutation.
@@ -470,6 +477,20 @@ private:
       Layout layout = layout_map_[original_buffer];
       Buffer new_buffer = buffer_remap_[original_buffer];
 
+      if (access_ptr_call->annotations.Get(attr::kPhysicalOffsetAccessPtr)) {
+        Array<PrimExpr> new_args = access_ptr_call->args;
+        new_args.Set(1, new_buffer->data);
+        if (offset.defined()) {
+          new_args.Set(2, analyzer_->Simplify(new_args[2] + offset.value()));
+        }
+        layout_remap_.Set(new_buffer, layout);
+        result.rewritten = true;
+        result.expr =
+            Call(access_ptr_call->dtype, access_ptr_call->op, new_args,
+                 access_ptr_call->annotations, access_ptr_call->span);
+        return result;
+      }
+
       // In TMA context, swizzle is encoded in TMA descriptor parameters
       // rather than in memory indices, so we only update buffer data
       // without recomputing indices.
@@ -640,6 +661,29 @@ private:
       PrimExpr extent = access_ptr_call->args[1];
       PrimExpr rw_mask = access_ptr_call->args[2];
 
+      if (access_ptr_call->annotations.Get(attr::kPhysicalOffsetAccessPtr)) {
+        ICHECK(!offset.defined())
+            << attr::kPhysicalOffsetAccessPtr
+            << " access_ptr does not support an extra shared-memory offset";
+        Buffer remap_key = FindRemapBuffer(load->buffer).value_or(load->buffer);
+        auto new_buffer = buffer_remap_.count(remap_key)
+                              ? buffer_remap_[remap_key]
+                              : load->buffer;
+        Array<PrimExpr> new_args = {BufferLoad(new_buffer, load->indices),
+                                    extent, rw_mask};
+        if (buffer_remap_.count(remap_key)) {
+          Optional<Layout> layout = FindLayout(remap_key);
+          if (layout.defined()) {
+            layout_remap_.Set(new_buffer, layout.value());
+          }
+        }
+        result.rewritten = true;
+        result.expr =
+            Call(access_ptr_call->dtype, access_ptr_call->op, new_args,
+                 access_ptr_call->annotations, access_ptr_call->span);
+        return result;
+      }
+
       Array<PrimExpr> indices = load->indices;
       Array<PrimExpr> old_shape = load->buffer->shape;
 
@@ -799,6 +843,38 @@ private:
       // shared-memory swizzle must still be reflected in pointer/index
       // remapping.
       return Downcast<Call>(IRMutatorWithAnalyzer::VisitExpr_(op));
+    }
+
+    if (op->op.same_as(tl::ptx_cp_async())) {
+      auto call = Downcast<Call>(IRMutatorWithAnalyzer::VisitExpr_(op));
+      ICHECK(call->args.size() == 3U || call->args.size() == 4U)
+          << "tl.ptx_cp_async expects 3 or 4 args, but got " << call->args;
+
+      Array<PrimExpr> new_args = call->args;
+      bool rewritten = false;
+      for (int ptr_idx = 0; ptr_idx < 2; ++ptr_idx) {
+        PrimExpr access_ptr = call->args[ptr_idx];
+        Call access_ptr_call = Downcast<Call>(access_ptr);
+        if (access_ptr_call->op.same_as(tl::access_ptr()) ||
+            access_ptr_call->op.same_as(builtin::tvm_access_ptr()) ||
+            access_ptr_call->op.same_as(builtin::address_of())) {
+          auto new_access_ptr =
+              HandleAccessPtrAndOffset(access_ptr, std::nullopt, call->dtype);
+          if (new_access_ptr.rewritten) {
+            new_args.Set(ptr_idx, new_access_ptr.expr);
+            rewritten = true;
+          }
+        } else {
+          LOG(FATAL) << "Invalid access ptr for tl.ptx_cp_async: "
+                     << access_ptr;
+        }
+      }
+
+      if (rewritten) {
+        return Call(call->dtype, call->op, new_args, call->annotations,
+                    call->span);
+      }
+      return call;
     }
 
     if (is_ptx_) {

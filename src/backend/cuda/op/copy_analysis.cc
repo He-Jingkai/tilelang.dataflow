@@ -304,6 +304,245 @@ bool CheckCPAsyncCopy(const CopyNode &op, Target target,
   return true;
 }
 
+bool CanProveRangeInAllocation(const Range &range, const PrimExpr &extent,
+                               arith::Analyzer *analyzer) {
+  return analyzer->CanProve(range->min >= 0,
+                            arith::ProofStrength::kSymbolicBound) &&
+         analyzer->CanProve(range->min + range->extent <= extent,
+                            arith::ProofStrength::kSymbolicBound);
+}
+
+bool IsTMADtypeSupported(DataType dtype) {
+  if (dtype.is_float4_e2m1fn() || dtype.is_bfloat16() || dtype.is_float8()) {
+    return true;
+  }
+  if (dtype.is_float()) {
+    return dtype.bits() == 8 || dtype.bits() == 16 || dtype.bits() == 32 ||
+           dtype.bits() == 64;
+  }
+  if (dtype.is_int() || dtype.is_uint()) {
+    return dtype.bits() == 8 || dtype.bits() == 16 || dtype.bits() == 32 ||
+           dtype.bits() == 64;
+  }
+  return false;
+}
+
+bool CheckTMABoxExtent(const PrimExpr &extent, bool innermost, DataType dtype,
+                       arith::Analyzer *analyzer, std::string *reason) {
+  const int64_t *value = as_const_int(analyzer->Simplify(extent));
+  if (value == nullptr || *value <= 0) {
+    *reason = "TMA box extents must be positive compile-time integers";
+    return false;
+  }
+  if (!innermost && *value > 256) {
+    *reason = "TMA non-innermost box extents must not exceed 256 elements";
+    return false;
+  }
+  if (innermost && dtype.bits() <= 0) {
+    *reason = "TMA requires a byte-addressable source dtype";
+    return false;
+  }
+  return true;
+}
+
+bool CheckContractTMARegions(const CopyNode &op,
+                             const TransferLoweringContext &context,
+                             std::string *reason) {
+  arith::Analyzer local_analyzer;
+  arith::Analyzer *analyzer =
+      context.analyzer != nullptr ? context.analyzer : &local_analyzer;
+  const size_t global_rank = op.src->shape.size();
+  if (global_rank == 0 || global_rank > 5) {
+    *reason = "TMA descriptors require source rank in [1, 5]";
+    return false;
+  }
+  if (op.src_range.size() != global_rank ||
+      op.dst_range.size() != op.dst->shape.size()) {
+    *reason = "copy region rank must match its physical buffer rank";
+    return false;
+  }
+  if (!IsTMADtypeSupported(op.src->dtype)) {
+    *reason = "source dtype cannot be represented by a CUDA tensor map";
+    return false;
+  }
+  if (!analyzer->CanProveEqual(op.src->elem_offset, 0)) {
+    *reason = "TMA descriptor source buffers must have zero element offset";
+    return false;
+  }
+  if (context.layout_map != nullptr && context.layout_map->count(op.src)) {
+    *reason = "TMA descriptor source buffers cannot have a remapped layout";
+    return false;
+  }
+
+  for (size_t axis = 0; axis < op.src->shape.size(); ++axis) {
+    const int64_t *shape =
+        as_const_int(analyzer->Simplify(op.src->shape[axis]));
+    if (shape == nullptr || *shape <= 0) {
+      *reason = "TMA descriptor source shapes must be positive compile-time "
+                "integers";
+      return false;
+    }
+    if (!CheckTMABoxExtent(op.src_range[axis]->extent,
+                           axis + 1 == op.src_range.size(), op.src->dtype,
+                           analyzer, reason)) {
+      return false;
+    }
+  }
+  Array<PrimExpr> global_strides = op.src->strides;
+  if (global_strides.empty()) {
+    PrimExpr stride = 1;
+    global_strides.resize(global_rank);
+    for (int axis = static_cast<int>(global_rank) - 1; axis >= 0; --axis) {
+      global_strides.Set(axis, stride);
+      stride *= op.src->shape[axis];
+    }
+  }
+  if (global_strides.size() != global_rank) {
+    *reason = "TMA descriptor stride rank must match source rank";
+    return false;
+  }
+  for (size_t axis = 0; axis < global_strides.size(); ++axis) {
+    PrimExpr stride_bytes = analyzer->Simplify(
+        TMABytesFromElements(global_strides[axis], op.src->dtype));
+    const int64_t *value = as_const_int(stride_bytes);
+    if (value == nullptr || *value <= 0) {
+      *reason = "TMA descriptor byte strides must be positive compile-time "
+                "integers";
+      return false;
+    }
+    if (axis + 1 < global_strides.size() &&
+        (*value % 16 != 0 || *value >= (int64_t{1} << 40))) {
+      *reason = "TMA descriptor outer byte strides must be 16-byte aligned "
+                "and smaller than 2^40";
+      return false;
+    }
+  }
+
+  PrimExpr shared_offset = 0;
+  PrimExpr shared_stride = 1;
+  for (int axis = static_cast<int>(op.dst_range.size()) - 1; axis >= 0;
+       --axis) {
+    shared_offset += op.dst_range[axis]->min * shared_stride;
+    shared_stride *= op.dst->shape[axis];
+  }
+  for (size_t axis = 0; axis < op.dst_range.size(); ++axis) {
+    const int64_t *shape =
+        as_const_int(analyzer->Simplify(op.dst->shape[axis]));
+    if (shape == nullptr || *shape <= 0) {
+      *reason = "TMA destination allocation shapes must be positive "
+                "compile-time integers";
+      return false;
+    }
+    if (!CanProveRangeInAllocation(op.dst_range[axis], op.dst->shape[axis],
+                                   analyzer)) {
+      *reason = "TMA destination region must be provably contained in its "
+                "physical shared allocation";
+      return false;
+    }
+  }
+  if (context.layout_map == nullptr || !context.layout_map->count(op.dst)) {
+    PrimExpr shared_offset_bytes =
+        analyzer->Simplify(TMABytesFromElements(shared_offset, op.dst->dtype));
+    if (!analyzer->CanProve(
+            FloorMod(shared_offset_bytes, IntImm(DataType::Int(64), 16)) == 0,
+            arith::ProofStrength::kSymbolicBound)) {
+      *reason = "TMA shared destination address must be provably 16-byte "
+                "aligned";
+      return false;
+    }
+  }
+
+  size_t src_axis = 0;
+  size_t dst_axis = 0;
+  while (src_axis < op.src_range.size() || dst_axis < op.dst_range.size()) {
+    while (src_axis < op.src_range.size() &&
+           analyzer->CanProveEqual(op.src_range[src_axis]->extent, 1)) {
+      ++src_axis;
+    }
+    while (dst_axis < op.dst_range.size() &&
+           analyzer->CanProveEqual(op.dst_range[dst_axis]->extent, 1)) {
+      ++dst_axis;
+    }
+    if (src_axis == op.src_range.size() || dst_axis == op.dst_range.size()) {
+      break;
+    }
+    if (!analyzer->CanProveEqual(op.src_range[src_axis]->extent,
+                                 op.dst_range[dst_axis]->extent)) {
+      *reason = "TMA source and destination non-unit extents must match in "
+                "logical order";
+      return false;
+    }
+    ++src_axis;
+    ++dst_axis;
+  }
+  while (src_axis < op.src_range.size() &&
+         analyzer->CanProveEqual(op.src_range[src_axis]->extent, 1)) {
+    ++src_axis;
+  }
+  while (dst_axis < op.dst_range.size() &&
+         analyzer->CanProveEqual(op.dst_range[dst_axis]->extent, 1)) {
+    ++dst_axis;
+  }
+  if (src_axis != op.src_range.size() || dst_axis != op.dst_range.size()) {
+    *reason = "TMA source and destination must have the same number of "
+              "non-unit logical dimensions";
+    return false;
+  }
+  return true;
+}
+
+bool ContractFillIsZero(const CopyNode &op, arith::Analyzer *analyzer) {
+  PrimExpr fill = op.transfer_contract.value()->oob_fill;
+  if (fill.dtype() != op.dst->dtype) {
+    fill = Cast(op.dst->dtype, fill);
+  }
+  return analyzer->CanProveEqual(analyzer->Simplify(fill),
+                                 make_zero(op.dst->dtype));
+}
+
+bool TensorMapOOBSatisfiesContract(const CopyNode &op,
+                                   arith::Analyzer *analyzer) {
+  if (!ContractFillIsZero(op, analyzer)) {
+    return false;
+  }
+
+  const Array<Range> &valid_region =
+      op.transfer_contract.value()->src_valid_region->region;
+  ICHECK_EQ(op.src_range.size(), valid_region.size());
+  ICHECK_EQ(op.src_range.size(), op.src->shape.size());
+  for (size_t axis = 0; axis < op.src_range.size(); ++axis) {
+    const Range &copy = op.src_range[axis];
+    const Range &valid = valid_region[axis];
+    PrimExpr copy_end = copy->min + copy->extent;
+    PrimExpr valid_end = valid->min + valid->extent;
+
+    // Tensor-map loads zero-fill coordinates outside [0, shape).  This is
+    // sufficient when every in-bounds coordinate in the requested box is
+    // also inside the contract's valid rectangle.
+    bool lower_covered =
+        analyzer->CanProve(valid->min <= 0,
+                           arith::ProofStrength::kSymbolicBound) ||
+        analyzer->CanProve(copy->min >= valid->min,
+                           arith::ProofStrength::kSymbolicBound);
+    bool upper_covered =
+        analyzer->CanProve(valid_end >= op.src->shape[axis],
+                           arith::ProofStrength::kSymbolicBound) ||
+        analyzer->CanProve(copy_end <= valid_end,
+                           arith::ProofStrength::kSymbolicBound);
+    if (!lower_covered || !upper_covered) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void AddRejectedCandidate(Array<String> *rejected, const char *candidate,
+                          const std::string &reason) {
+  std::ostringstream oss;
+  oss << candidate << ": " << reason;
+  rejected->push_back(String(oss.str()));
+}
+
 } // namespace
 
 const char *CopyInstToString(CopyInst inst) {
@@ -537,6 +776,37 @@ CopyFacts AnalyzeCopyFacts(const CopyNode &op, const CopyAnalysisContext &ctx) {
 
 CopyInstSelection SelectCopyInstForLowering(const CopyNode &op,
                                             const CopyAnalysisContext &ctx) {
+  if (op.transfer_contract.defined()) {
+    TransferLoweringContext transfer_context;
+    transfer_context.target = ctx.target;
+    transfer_context.layout_map = ctx.layout_map;
+    transfer_context.analyzer = ctx.analyzer;
+    transfer_context.buffer_oob = ctx.buffer_oob;
+    transfer_context.emit_diagnostics = ctx.emit_diagnostics;
+    if (auto consumed = op.annotations.Get(kTransferPipelineSyncConsumed)) {
+      if (const auto *value = consumed.value().as<IntImmNode>()) {
+        transfer_context.pipeline_owns_synchronization =
+            value->value == kTransferPipelineSyncManaged;
+        transfer_context.force_synchronous =
+            value->value == kTransferPipelineSyncFallback;
+      }
+    }
+    TransferLoweringPlan plan = ResolveTransferLowering(op, transfer_context);
+    if (!plan->supported) {
+      return Unsupported(plan->selection_reason);
+    }
+    if (plan->implementation_id == kTransferImplCudaTMAFull ||
+        plan->implementation_id == kTransferImplCudaTMATail) {
+      return Supported(CopyInst::kBulkLoad);
+    }
+    if (plan->implementation_id == kTransferImplCudaCPAsync) {
+      return Supported(CopyInst::kCPAsync);
+    }
+    ICHECK_EQ(plan->implementation_id, kTransferImplCommonSIMT)
+        << "unknown transfer lowering implementation "
+        << plan->implementation_id;
+    return Supported(CopyInst::kNormal);
+  }
   CopyFacts facts = AnalyzeCopyFacts(op, ctx);
   if (facts.cluster_mask != 0) {
     if (facts.can_bulk_load) {
@@ -580,6 +850,28 @@ CopyInstSelection SelectCopyInstForLowering(const CopyNode &op,
 std::string ClassifyCopyForInstructionAnnotation(const CopyNode &op,
                                                  Target target,
                                                  bool in_pipeline) {
+  if (op.transfer_contract.defined()) {
+    const TransferContract &contract = op.transfer_contract.value();
+    if (!in_pipeline ||
+        contract->GetSyncOwner() != TransferSyncOwner::kPipeline) {
+      return "sync";
+    }
+    TransferLoweringContext context;
+    context.target = target;
+    context.pipeline_owns_synchronization = true;
+    TransferLoweringPlan plan = ResolveTransferLowering(op, context);
+    if (!plan->supported) {
+      return "sync";
+    }
+    if (plan->implementation_id == kTransferImplCudaTMAFull ||
+        plan->implementation_id == kTransferImplCudaTMATail) {
+      return "tma";
+    }
+    if (plan->implementation_id == kTransferImplCudaCPAsync) {
+      return "cp_async";
+    }
+    return "sync";
+  }
   CopyAnalysisContext ctx;
   ctx.target = target;
   CopyFacts facts = AnalyzeCopyFacts(op, ctx);
@@ -612,6 +904,28 @@ std::string ClassifyCopyForInstructionAnnotation(const CopyNode &op,
 
 CopyInstSelection ClassifyWarpSpecializedProducerCopy(const CopyNode &op,
                                                       Target target) {
+  if (op.transfer_contract.defined()) {
+    const TransferContract &contract = op.transfer_contract.value();
+    if (contract->GetSyncOwner() != TransferSyncOwner::kPipeline) {
+      return Unsupported(
+          "typed transfer synchronization is not owned by the pipeline");
+    }
+    TransferLoweringContext context;
+    context.target = target;
+    context.pipeline_owns_synchronization = true;
+    TransferLoweringPlan plan = ResolveTransferLowering(op, context);
+    if (!plan->supported) {
+      return Unsupported(plan->selection_reason);
+    }
+    if (plan->implementation_id == kTransferImplCudaTMAFull ||
+        plan->implementation_id == kTransferImplCudaTMATail) {
+      return Supported(CopyInst::kBulkLoad);
+    }
+    if (plan->implementation_id == kTransferImplCudaCPAsync) {
+      return Supported(CopyInst::kCPAsync);
+    }
+    return Supported(CopyInst::kNormal);
+  }
   CopyAnalysisContext ctx;
   ctx.target = target;
   CopyFacts facts = AnalyzeCopyFacts(op, ctx);
@@ -651,6 +965,18 @@ CopyInstSelection ClassifyWarpSpecializedProducerCopy(const CopyNode &op,
 }
 
 bool IsPipelineManagedCPAsyncCopy(const CopyNode &op, Target target) {
+  if (op.transfer_contract.defined()) {
+    const TransferContract &contract = op.transfer_contract.value();
+    if (contract->GetSyncOwner() != TransferSyncOwner::kPipeline) {
+      return false;
+    }
+    TransferLoweringContext context;
+    context.target = target;
+    context.pipeline_owns_synchronization = true;
+    TransferLoweringPlan plan = ResolveTransferLowering(op, context);
+    return plan->supported &&
+           plan->implementation_id == kTransferImplCudaCPAsync;
+  }
   CopyAnalysisContext ctx;
   ctx.target = target;
   CopyFacts facts = AnalyzeCopyFacts(op, ctx);
@@ -659,6 +985,147 @@ bool IsPipelineManagedCPAsyncCopy(const CopyNode &op, Target target) {
     return false;
   }
   return facts.can_cp_async;
+}
+
+TransferLoweringPlan
+ResolveCudaTransferLowering(const CopyNode &op,
+                            const TransferLoweringContext &context) {
+  ICHECK(op.transfer_contract.defined());
+  arith::Analyzer local_analyzer;
+  arith::Analyzer *analyzer =
+      context.analyzer != nullptr ? context.analyzer : &local_analyzer;
+  const TransferContract &contract = op.transfer_contract.value();
+  bool requires_contract_fill = TransferRequiresPostFill(op, analyzer);
+  Array<String> rejected;
+
+  TransferSyncOwner sync_owner = contract->GetSyncOwner();
+  if (sync_owner == TransferSyncOwner::kCaller) {
+    return MakeTransferLoweringPlan(
+        kTransferImplCommonSIMT, /*supported=*/false,
+        /*asynchronous=*/false, /*uses_tma_descriptor=*/false,
+        /*requires_post_fill=*/false,
+        "caller synchronization ownership has no common lowering consumer");
+  }
+  if (sync_owner == TransferSyncOwner::kPipeline &&
+      !context.pipeline_owns_synchronization && !context.force_synchronous) {
+    return MakeTransferLoweringPlan(
+        kTransferImplCommonSIMT, /*supported=*/false,
+        /*asynchronous=*/false, /*uses_tma_descriptor=*/false,
+        /*requires_post_fill=*/false,
+        "pipeline synchronization ownership was not consumed by a pipeline "
+        "lowering pass");
+  }
+  if (context.force_synchronous) {
+    ICHECK(sync_owner == TransferSyncOwner::kPipeline)
+        << "only a pipeline-owned transfer can use the compiler's "
+           "synchronous fallback";
+    AddRejectedCandidate(&rejected, kTransferImplCudaTMAFull,
+                         "pipeline planning selected synchronous fallback");
+    AddRejectedCandidate(&rejected, kTransferImplCudaTMATail,
+                         "pipeline planning selected synchronous fallback");
+    AddRejectedCandidate(&rejected, kTransferImplCudaCPAsync,
+                         "pipeline planning selected synchronous fallback");
+    return MakeTransferLoweringPlan(
+        kTransferImplCommonSIMT, /*supported=*/true,
+        /*asynchronous=*/false, /*uses_tma_descriptor=*/false,
+        /*requires_post_fill=*/false,
+        "pipeline planning selected synchronous transfer fallback", rejected);
+  }
+  if (!contract->allow_async) {
+    AddRejectedCandidate(&rejected, kTransferImplCudaTMAFull,
+                         "transfer contract disallows asynchronous execution");
+    AddRejectedCandidate(&rejected, kTransferImplCudaTMATail,
+                         "transfer contract disallows asynchronous execution");
+    AddRejectedCandidate(&rejected, kTransferImplCudaCPAsync,
+                         "transfer contract disallows asynchronous execution");
+    return MakeTransferLoweringPlan(
+        kTransferImplCommonSIMT, /*supported=*/true,
+        /*asynchronous=*/false, /*uses_tma_descriptor=*/false,
+        /*requires_post_fill=*/false,
+        "transfer contract requires synchronous execution", rejected);
+  }
+
+  CopyAnalysisContext copy_context;
+  copy_context.target = context.target;
+  copy_context.layout_map = context.layout_map;
+  copy_context.analyzer = analyzer;
+  copy_context.buffer_oob = context.buffer_oob;
+  copy_context.emit_diagnostics = context.emit_diagnostics;
+  CopyFacts facts = AnalyzeCopyFacts(op, copy_context);
+
+  std::string tma_region_reason;
+  bool tma_regions_legal =
+      CheckContractTMARegions(op, context, &tma_region_reason);
+  bool tma_enabled = !facts.disable_tma && !facts.pass_context_disables_tma;
+  bool tma_legal = tma_enabled && facts.can_bulk_load && tma_regions_legal;
+  if (!requires_contract_fill && tma_legal) {
+    return MakeTransferLoweringPlan(
+        kTransferImplCudaTMAFull, /*supported=*/true,
+        /*asynchronous=*/true, /*uses_tma_descriptor=*/true,
+        /*requires_post_fill=*/false,
+        "full logical source region is valid for descriptor-based TMA load",
+        rejected);
+  }
+  if (requires_contract_fill) {
+    AddRejectedCandidate(&rejected, kTransferImplCudaTMAFull,
+                         "logical source region is not provably fully valid");
+  } else if (!tma_enabled) {
+    AddRejectedCandidate(&rejected, kTransferImplCudaTMAFull,
+                         "TMA lowering is disabled by compile policy");
+  } else if (!facts.can_bulk_load) {
+    AddRejectedCandidate(&rejected, kTransferImplCudaTMAFull,
+                         facts.tma_unavailable_reason);
+  } else if (!tma_regions_legal) {
+    AddRejectedCandidate(&rejected, kTransferImplCudaTMAFull,
+                         tma_region_reason);
+  }
+
+  if (requires_contract_fill && tma_legal) {
+    bool requires_post_fill = !TensorMapOOBSatisfiesContract(op, analyzer);
+    return MakeTransferLoweringPlan(
+        kTransferImplCudaTMATail, /*supported=*/true,
+        /*asynchronous=*/true, /*uses_tma_descriptor=*/true, requires_post_fill,
+        requires_post_fill
+            ? "tail/OOB TMA load followed by cooperative contract post-fill"
+            : "tail/OOB TMA load whose tensor-bound zero-fill satisfies the "
+              "contract",
+        rejected);
+  }
+  if (!requires_contract_fill) {
+    AddRejectedCandidate(&rejected, kTransferImplCudaTMATail,
+                         "tail repair is unnecessary for a full valid tile");
+  } else if (!tma_enabled) {
+    AddRejectedCandidate(&rejected, kTransferImplCudaTMATail,
+                         "TMA lowering is disabled by compile policy");
+  } else if (!facts.can_bulk_load) {
+    AddRejectedCandidate(&rejected, kTransferImplCudaTMATail,
+                         facts.tma_unavailable_reason);
+  } else if (!tma_regions_legal) {
+    AddRejectedCandidate(&rejected, kTransferImplCudaTMATail,
+                         tma_region_reason);
+  }
+
+  if (facts.can_cp_async &&
+      (!requires_contract_fill || ContractFillIsZero(op, analyzer))) {
+    return MakeTransferLoweringPlan(
+        kTransferImplCudaCPAsync, /*supported=*/true,
+        /*asynchronous=*/true, /*uses_tma_descriptor=*/false,
+        /*requires_post_fill=*/false,
+        requires_contract_fill
+            ? "predicated zero-fill cp.async is legal for the transfer contract"
+            : "full-tile cp.async is legal for the transfer contract",
+        rejected);
+  }
+  AddRejectedCandidate(
+      &rejected, kTransferImplCudaCPAsync,
+      !facts.can_cp_async
+          ? facts.async_unavailable_reason
+          : "cp.async predication only supports a zero OOB fill value");
+  return MakeTransferLoweringPlan(
+      kTransferImplCommonSIMT, /*supported=*/true,
+      /*asynchronous=*/false, /*uses_tma_descriptor=*/false,
+      /*requires_post_fill=*/false,
+      "no accelerated CUDA transfer candidate is legal", rejected);
 }
 
 } // namespace cuda

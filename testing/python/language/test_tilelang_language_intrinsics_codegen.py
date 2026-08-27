@@ -26,5 +26,23 @@ def test_language_ldg_codegen():
     assert "__ldg(&" in src or "__ldg(&(" in src, "Expected address-of form in __ldg call"
 
 
+@tilelang.testing.requires_cuda
+def test_language_fast_fdiv_codegen():
+    N = 128
+
+    @T.prim_func
+    def main(
+        x: T.Tensor((N,), T.float32),
+        y: T.Tensor((N,), T.float32),
+        out: T.Tensor((N,), T.float32),
+    ):
+        with T.Kernel(N, threads=32) as pid:
+            out[pid] = T.fast_fdiv(x[pid], y[pid])
+
+    kernel = tilelang.compile(main, out_idx=[2], target="cuda")
+    src = kernel.get_kernel_source()
+    assert "__fdividef(" in src
+
+
 if __name__ == "__main__":
     tilelang.testing.main()

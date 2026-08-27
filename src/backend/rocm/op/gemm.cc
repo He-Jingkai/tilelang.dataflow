@@ -133,6 +133,22 @@ struct Gemm {
     }
     return "unknown";
   }
+
+  static GemmLoweringPlan ResolveLowering(const GemmNode &op,
+                                          const GemmLoweringContext &context) {
+    Array<Integer> shape = {Integer(op.logical_m()), Integer(op.logical_n()),
+                            Integer(op.logical_k())};
+    if (op.isWgmma_ || op.isTcgen05_) {
+      return MakeGemmLoweringPlan("rocm.gemm.sync", false, true, shape, shape,
+                                  false, false, {}, 0, 0, 0,
+                                  "explicit CUDA GEMM is unavailable on ROCm");
+    }
+    String implementation =
+        TargetIsCDNA(context.target) ? "rocm.mfma.sync" : "rocm.wmma.sync";
+    return MakeGemmLoweringPlan(implementation, true, true, shape, shape, false,
+                                op.m_ != op.logical_m(), {}, 0, 0, 0,
+                                "ROCm GEMM preserves the logical shape");
+  }
 };
 
 } // namespace rocm
@@ -149,6 +165,7 @@ bool RegisterROCmGemm() {
       rocm::Gemm::ComputeWarpPartition,
       rocm::Gemm::ReuseExistingSharedLayout,
       rocm::Gemm::InstructionKind,
+      rocm::Gemm::ResolveLowering,
   });
   return true;
 }

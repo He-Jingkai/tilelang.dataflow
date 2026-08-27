@@ -185,6 +185,35 @@ def test_reduce_clear(op, dtype, M, N, src_scope, dst_scope):
     torch.testing.assert_close(B, ref, atol=1e-2, rtol=1e-2)
 
 
+@tilelang.testing.requires_cuda
+def test_reduce_fragment_region_subview_sum_and_max():
+    M, logical_M, N = 64, 32, 64
+    dtype = T.float32
+
+    @tilelang.jit(out_idx=-1)
+    def kernel():
+        @T.prim_func
+        def main(A: T.Tensor((M, N), dtype), B: T.Tensor((2, logical_M), dtype)):
+            with T.Kernel(1, threads=128):
+                src = T.alloc_fragment((M, N), dtype)
+                sum_frag = T.alloc_fragment((M,), dtype)
+                max_frag = T.alloc_fragment((M,), dtype)
+                T.copy(A, src)
+                T.reduce_sum(src[0:logical_M, 0:N], sum_frag[0:logical_M], dim=1)
+                T.fill(max_frag[0:logical_M], -T.infinity(dtype))
+                T.reduce_max(src[0:logical_M, 0:N], max_frag[0:logical_M], dim=1, clear=False)
+                for i in T.Parallel(logical_M):
+                    B[0, i] = sum_frag[i]
+                    B[1, i] = max_frag[i]
+
+        return main
+
+    A = torch.randn(M, N, dtype=torch.float32).cuda()
+    B = kernel()(A)
+    torch.testing.assert_close(B[0], A[:logical_M].sum(dim=1), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(B[1], A[:logical_M].max(dim=1).values, atol=1e-2, rtol=1e-2)
+
+
 # ---------------------------------------------------------------------------
 # T.finalize_reducer tests
 # ---------------------------------------------------------------------------

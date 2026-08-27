@@ -105,6 +105,18 @@ def test_num_stages_one_pure_tma_keeps_auto_warp_specialize():
     assert "tl::tma_load" in src
     assert "__launch_bounds__(160, 1)" in src
     assert "if (32 <= ((int)threadIdx.x))" in src
+    # The producer-local first warp is physical warp 1, while
+    # tl_shuffle_elect<128> elects physical warp 4 for this launch shape.
+    # Reuse waits must follow the physical TMA issuer to avoid both an ABA
+    # parity hang and an unguarded second-generation launch.
+    reuse_wait = src.index("mbarrier[1].wait")
+    issuer_guard = src[max(0, reuse_wait - 180) : reuse_wait]
+    assert "threadIdx.x" in issuer_guard
+    assert "& 127" in issuer_guard or "== 4" in issuer_guard
+    assert "threadIdx.x) >> 5) == 1" not in issuer_guard
+    assert "& 127) >> 5) == 1" not in issuer_guard
+    tma_issue = src.index("tl::tma_load", reuse_wait)
+    assert reuse_wait < tma_issue
 
     x = torch.randn((M, K), device="cuda", dtype=torch.float16)
     y = kernel(x)
@@ -290,7 +302,7 @@ def test_num_stages_one_mixed_tma_cp_async_keeps_auto_ws():
     src = kernel.get_kernel_source()
     assert "tl::tma_load" in src
     producer_idx = src.index("if (128 <= ((int)threadIdx.x)) {")
-    consumer_idx = src.index("} else {", producer_idx)
+    consumer_idx = src.index("if (((int)threadIdx.x) < 128) {", producer_idx)
     cp_async_idx = src.index("cp_async_gs<16>")
 
     assert producer_idx < cp_async_idx < consumer_idx
@@ -338,8 +350,11 @@ def test_mixed_tma_cp_async_shared_stage_barriers():
     assert "uint64_t mbarrier_mem[6]" in src
     assert "arrive_and_expect_tx" not in src
     assert ".expect_transaction(8192);" in src
-    assert src.count(".init(128);") == 6
-    assert ".init(1);" not in src
+    # The three forward barriers collect arrivals from the 128 producer
+    # threads.  The three recycle barriers are released by one elected
+    # consumer warpgroup thread.
+    assert src.count(".init(128);") == 3
+    assert src.count(".init(1);") == 3
     # Mixed TMA+cp.async should reuse the same forward barrier set. Depending on
     # when cp.async is lowered, this may appear either as an explicit
     # noinc-arrive or as a regular arrive on the same forward barrier after the
@@ -396,10 +411,12 @@ def test_sparse_ws_regular_metadata_copy_stays_in_producer():
 
     src = kernel.get_kernel_source()
     producer_idx = src.index("if (128 <= ((int)threadIdx.x)) {")
-    consumer_idx = src.index("} else {", producer_idx)
+    consumer_idx = src.index("if (((int)threadIdx.x) < 128) {", producer_idx)
     metadata_copy_idx = src.index("tl::tma_load(E_desc")
+    gemm_idx = src.index("tl::wgmma_sp_ss<")
 
     assert producer_idx < metadata_copy_idx < consumer_idx
+    assert consumer_idx < gemm_idx
     assert "tl::tma_load(E_desc" not in src[consumer_idx:]
 
 
@@ -489,22 +506,25 @@ def test_pure_tma_consumer_local_init_does_not_leak_into_producer():
 
     src = kernel.get_kernel_source()
     producer_idx = src.index("if (128 <= ((int)threadIdx.x)) {")
-    consumer_idx = src.index("} else {", producer_idx)
+    consumer_idx = src.index("if (((int)threadIdx.x) < 128) {", producer_idx)
     prelude_src = src[:producer_idx]
     producer_src = src[producer_idx:consumer_idx]
     consumer_src = src[consumer_idx:]
     flat_src = " ".join(src.split())
 
-    assert src.count(".init(1);") == 3
-    assert src.count(".init(128);") == 2
+    # One elected producer thread arms the combined K/V forward barrier and
+    # the one-shot Q barrier; elected consumer threads release the two recycle
+    # barriers.
+    assert src.count(".init(1);") == 4
+    assert ".init(128);" not in src
     assert "tl::tma_load(K_desc, mbarrier[0]" in src
-    assert "tl::tma_load(V_desc, mbarrier[1]" in src
+    assert "tl::tma_load(V_desc, mbarrier[0]" in src
     assert re.search(r"mbarrier\[2\]\.wait\([^;]+\);", flat_src)
     assert re.search(r"mbarrier\[3\]\.wait\([^;]+\);", flat_src)
     assert re.search(r"mbarrier\[0\]\.wait\([^;]+\);", flat_src)
     assert re.search(r"mbarrier\[1\]\.wait\([^;]+\);", flat_src)
+    assert "mbarrier[1].arrive();" in consumer_src
     assert "mbarrier[2].arrive();" in consumer_src
-    assert "mbarrier[3].arrive();" in consumer_src
     assert "block_mask" in producer_src
     assert "block_mask" in consumer_src
     assert "acc_o" not in producer_src

@@ -8,6 +8,7 @@
 
 #include "../op/builtin.h"
 #include "../op/copy.h"
+#include "../op/gemm.h"
 #include "../op/parallel.h"
 #include "../op/region.h"
 #include "../op/utils.h"
@@ -94,6 +95,10 @@ public:
 
   BufferRegionMap mbar_to_buffer_writes_;
 
+  Array<BufferRegion> wgmma_wait_buffer_reads_;
+
+  Array<BufferRegion> wgmma_wait_buffer_writes_;
+
 private:
   Map<Var, Buffer> buffer_data_to_buffer_;
 
@@ -118,8 +123,28 @@ private:
     return (*it).second;
   }
 
+  void RecordWgmmaDependencies(const GemmNode *gemm) {
+    if (gemm == nullptr || !gemm->isWgmma_) {
+      return;
+    }
+    AccessRegions access = gemm->GetAccessRegions();
+    wgmma_wait_buffer_reads_.insert(wgmma_wait_buffer_reads_.end(),
+                                    access.reads.begin(), access.reads.end());
+    wgmma_wait_buffer_writes_.insert(wgmma_wait_buffer_writes_.end(),
+                                     access.writes.begin(),
+                                     access.writes.end());
+  }
+
   void VisitExpr_(const CallNode *op) final {
     auto args = op->args;
+    if (auto tile_op = ParseOperator(tvm::ffi::GetRef<Call>(op));
+        tile_op.defined()) {
+      if (const auto *gemm = tile_op.as<GemmNode>()) {
+        RecordWgmmaDependencies(gemm);
+      }
+      StmtExprVisitor::VisitExpr_(op);
+      return;
+    }
     if (op->op.same_as(builtin::call_extern())) {
       std::string func_name_with_template = args[0].as<StringImmNode>()->value;
       std::size_t le_pos = func_name_with_template.find_first_of('<');
@@ -165,7 +190,6 @@ private:
               BufferRegion::FullRegion(c_buf));
         }
       }
-      // TODO (lei) Link wgmma to buffers and tl.wait_wgmma
     } else if (op->op.same_as(initialize_tcgen05_descriptor())) {
       // Lowered form: initialize_tcgen05_descriptor(desc, start_addr, ...)
       // args[1] is a tvm_access_ptr to the shared memory buffer (A or B).
@@ -466,6 +490,14 @@ private:
           writes_.insert(writes_.end(), regions.begin(), regions.end());
         }
       }
+    } else if (op->op.same_as(tl::wait_wgmma()) ||
+               op->op.same_as(tl::warpgroup_wait())) {
+      reads_.insert(reads_.end(),
+                    chain_builder_.wgmma_wait_buffer_reads_.begin(),
+                    chain_builder_.wgmma_wait_buffer_reads_.end());
+      writes_.insert(writes_.end(),
+                     chain_builder_.wgmma_wait_buffer_writes_.begin(),
+                     chain_builder_.wgmma_wait_buffer_writes_.end());
     } else {
       StmtExprVisitor::VisitExpr_(op);
     }
@@ -497,9 +529,72 @@ private:
   bool within_condition_expr_ = false;
 };
 
+class PipelineTransferOwnershipAnnotator : public StmtExprMutator {
+public:
+  static Stmt Annotate(const Stmt &stmt, bool synchronous_fallback = false) {
+    PipelineTransferOwnershipAnnotator annotator(synchronous_fallback);
+    return annotator.VisitStmt(stmt);
+  }
+
+private:
+  explicit PipelineTransferOwnershipAnnotator(bool synchronous_fallback)
+      : synchronization_mode_(synchronous_fallback
+                                  ? kTransferPipelineSyncFallback
+                                  : kTransferPipelineSyncManaged) {}
+
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
+    auto tile_op = ParseOperator(call);
+    const auto *copy = tile_op.as<CopyNode>();
+    if (copy == nullptr || !copy->transfer_contract.defined() ||
+        copy->transfer_contract.value()->GetSyncOwner() !=
+            TransferSyncOwner::kPipeline) {
+      return call;
+    }
+    auto annotations = call->annotations;
+    annotations.Set(kTransferPipelineSyncConsumed,
+                    IntImm(DataType::Int(32), synchronization_mode_));
+    return Call(call->dtype, call->op, call->args, annotations, call->span);
+  }
+
+  int synchronization_mode_;
+};
+
+class SynchronousPipelineTransferSyncInserter : public StmtExprMutator {
+public:
+  static Stmt Insert(const Stmt &stmt) {
+    SynchronousPipelineTransferSyncInserter inserter;
+    return inserter.VisitStmt(stmt);
+  }
+
+private:
+  Stmt VisitStmt_(const EvaluateNode *op) final {
+    Evaluate evaluate = Downcast<Evaluate>(StmtExprMutator::VisitStmt_(op));
+    const auto *call = evaluate->value.as<CallNode>();
+    if (call == nullptr) {
+      return evaluate;
+    }
+    auto tile_op = ParseOperator(ffi::GetRef<Call>(call));
+    const auto *copy = tile_op.as<CopyNode>();
+    const auto *mode = call->annotations.Get(kTransferPipelineSyncConsumed)
+                           .value_or(ObjectRef())
+                           .as<IntImmNode>();
+    if (copy == nullptr || mode == nullptr ||
+        mode->value != kTransferPipelineSyncFallback ||
+        !IsSharedBuffer(copy->dst)) {
+      return evaluate;
+    }
+    Stmt sync = Evaluate(Call(DataType::Int(32), builtin::tvm_storage_sync(),
+                              {StringImm("shared")}));
+    return SeqStmt({evaluate, sync});
+  }
+};
+
 class PipelinePlanner : public StmtExprMutator {
 public:
-  static Stmt Substitute(const PrimFunc &f, bool use_async_copy = true) {
+  static Stmt Substitute(const PrimFunc &f,
+                         Array<Map<String, ObjectRef>> *lowering_decisions,
+                         bool use_async_copy = true) {
     PipelinePlanner substituter(use_async_copy);
     for (const auto &[_, buffer] : f->buffer_map) {
       substituter.buffer_data_to_buffer_.Set(buffer->data, buffer);
@@ -508,12 +603,76 @@ public:
     ICHECK(target.defined())
         << "Pipeline_Planning: Require the target attribute";
     substituter.target_ = target.value();
-    return substituter.VisitStmt(f->body);
+    Stmt body = substituter.VisitStmt(f->body);
+    if (lowering_decisions != nullptr) {
+      *lowering_decisions = substituter.lowering_decisions_;
+    }
+    return body;
   }
 
 private:
   PipelinePlanner() = default;
   PipelinePlanner(bool use_async_copy) : use_async_copy_(use_async_copy) {}
+
+  void RecordDecision(int requested_stages, String implementation,
+                      String reason, bool fallback) {
+    Map<String, ObjectRef> decision;
+    decision.Set("schema_version",
+                 Integer(kPipelineDecisionCurrentSchemaVersion));
+    decision.Set("loop_index", Integer(next_pipeline_loop_index_++));
+    decision.Set("requested_stages", Integer(requested_stages));
+    decision.Set("selected_implementation",
+                 StringImm(std::move(implementation)));
+    decision.Set("fallback", Bool(fallback));
+    decision.Set("selection_reason", StringImm(std::move(reason)));
+    lowering_decisions_.push_back(std::move(decision));
+  }
+
+  Optional<SeqStmt> FindPipelineBodySeq(const Stmt &root,
+                                        std::string *rejection_reason) {
+    Stmt current = root;
+    while (true) {
+      if (const auto *seq_stmt = current.as<SeqStmtNode>()) {
+        return ffi::GetRef<SeqStmt>(seq_stmt);
+      }
+      if (const auto *if_then_else = current.as<IfThenElseNode>()) {
+        if (if_then_else->else_case.defined()) {
+          *rejection_reason = "pipeline loop body contains an if/else branch";
+          return std::nullopt;
+        }
+        current = if_then_else->then_case;
+        continue;
+      }
+      if (const auto *let_stmt = current.as<LetStmtNode>()) {
+        current = let_stmt->body;
+        continue;
+      }
+      *rejection_reason = "pipeline loop body does not contain a schedulable "
+                          "statement sequence";
+      return std::nullopt;
+    }
+  }
+
+  Stmt SynchronousFallback(const For &loop, int requested_stages,
+                           String reason) {
+    Map<String, Any> annotations;
+    for (const auto &[key, value] : loop->annotations) {
+      if (key != "num_stages" && key != "tl_pipeline_order" &&
+          key != "tl_pipeline_stage" && key != "tl_pipeline_group" &&
+          key != kPipelineDataflowMode &&
+          key != kPipelineDataflowFallbackReason) {
+        annotations.Set(key, value);
+      }
+    }
+    Stmt body = VisitStmt(loop->body);
+    body = PipelineTransferOwnershipAnnotator::Annotate(
+        body, /*synchronous_fallback=*/true);
+    body = SynchronousPipelineTransferSyncInserter::Insert(body);
+    RecordDecision(requested_stages, "synchronous", std::move(reason),
+                   /*fallback=*/true);
+    return For(loop->loop_var, loop->min, loop->extent, loop->kind, body,
+               loop->thread_binding, annotations, loop->step, loop->span);
+  }
 
   /*! \brief Information about a pipeline stage
    *
@@ -1043,27 +1202,17 @@ private:
         pipeline_body_root = loop->body;
       }
       {
-        Stmt current = pipeline_body_root;
-        while (true) {
-          if (const auto *seq_stmt = current.as<SeqStmtNode>()) {
-            pipeline_body_seq = tvm::ffi::GetRef<SeqStmt>(seq_stmt);
-            break;
+        std::string rejection_reason;
+        pipeline_body_seq =
+            FindPipelineBodySeq(pipeline_body_root, &rejection_reason);
+        if (!pipeline_body_seq.defined()) {
+          int requested_stages = 1;
+          for (const auto &stage : stage_array) {
+            requested_stages =
+                std::max(requested_stages, static_cast<int>(stage->value) + 1);
           }
-          if (const auto *if_then_else = current.as<IfThenElseNode>()) {
-            ICHECK(!if_then_else->else_case.defined())
-                << "Pipeline_Planning: Can't handle the body of the loop "
-                   "because the IfThenElse node has an else branch";
-            current = if_then_else->then_case;
-            continue;
-          }
-          if (const auto *let_stmt = current.as<LetStmtNode>()) {
-            current = let_stmt->body;
-            continue;
-          }
-          LOG(FATAL) << "Pipeline_Planning: Can't handle the body of the loop "
-                     << "because it is not a SeqStmt, IfThenElse without else, "
-                     << "or LetStmt wrapping them, but got "
-                     << current->GetTypeKey();
+          return SynchronousFallback(ffi::GetRef<For>(loop), requested_stages,
+                                     String(rejection_reason));
         }
       }
       ICHECK(pipeline_body_seq.defined());
@@ -1072,12 +1221,34 @@ private:
           stage_array, &annotations);
       auto for_node = tvm::ffi::GetRef<For>(loop);
       for_node.CopyOnWrite()->annotations = annotations;
+      auto *mutable_for = for_node.CopyOnWrite();
+      mutable_for->body =
+          PipelineTransferOwnershipAnnotator::Annotate(mutable_for->body);
+      int requested_stages = 1;
+      for (const auto &stage : stage_array) {
+        requested_stages =
+            std::max(requested_stages, static_cast<int>(stage->value) + 1);
+      }
+      RecordDecision(requested_stages, "software_pipeline",
+                     "explicit stage/order contract accepted",
+                     /*fallback=*/false);
       return for_node;
     }
 
     if (!num_stages_anno)
       return StmtExprMutator::VisitStmt_(loop);
     int num_stages = num_stages_anno->as<IntImmNode>()->value;
+    if (PipelineDataflowForcesSynchronous(ffi::GetRef<For>(loop))) {
+      String reason = "typed pipeline dataflow plan selected synchronous mode";
+      if (auto annotated_reason =
+              loop->annotations.Get(kPipelineDataflowFallbackReason)) {
+        if (const auto *value = annotated_reason.value().as<StringImmNode>()) {
+          reason = value->value;
+        }
+      }
+      return SynchronousFallback(ffi::GetRef<For>(loop), num_stages,
+                                 std::move(reason));
+    }
     // Skip software pipelining on ROCm targets where async-copy pipelining
     // has not been validated.  Currently only gfx950 (CDNA4 / MI350) supports
     // the full HIP async-copy pipeline path.  gfx942 (CDNA3 / MI300X) has
@@ -1085,21 +1256,13 @@ private:
     // been validated yet, so it falls back to a plain sequential loop as well.
     // RDNA targets have no async-copy support at all and also fall back.
     if (TargetIsRocm(target_) && !TargetIsGfx950(target_) && num_stages >= 1) {
-      // Strip the "num_stages" annotation before recursing so that downstream
-      // passes (InjectSoftwarePipeline, MultiVersionBufferRewriter, etc.) do
-      // not treat this loop as pipelined.  Leaving the annotation in place
-      // would cause those passes to multi-version shared buffers and inject
-      // cp.async / barrier code that is incompatible with the plain sequential
-      // execution path chosen here.
-      auto stripped = tvm::ffi::GetRef<For>(loop);
-      Map<String, Any> annotations;
-      for (const auto &[key, value] : loop->annotations) {
-        if (key != "num_stages") {
-          annotations.Set(key, value);
-        }
-      }
-      stripped.CopyOnWrite()->annotations = annotations;
-      return StmtExprMutator::VisitStmt_(stripped.get());
+      return SynchronousFallback(
+          ffi::GetRef<For>(loop), num_stages,
+          "target does not provide a validated software-pipeline path");
+    }
+    if (loop->kind != ForKind::kSerial) {
+      return SynchronousFallback(ffi::GetRef<For>(loop), num_stages,
+                                 "pipeline loop must be serial");
     }
     Stmt pipeline_body_root{nullptr};
     if (const auto *realize = loop->body.as<BlockRealizeNode>()) {
@@ -1113,34 +1276,16 @@ private:
       pipeline_body_root = loop->body;
     }
     Optional<SeqStmt> pipeline_body_seq;
-    {
-      Stmt current = pipeline_body_root;
-      while (true) {
-        if (const auto *seq_stmt = current.as<SeqStmtNode>()) {
-          pipeline_body_seq = tvm::ffi::GetRef<SeqStmt>(seq_stmt);
-          break;
-        }
-        if (const auto *if_then_else = current.as<IfThenElseNode>()) {
-          ICHECK(!if_then_else->else_case.defined())
-              << "Pipeline_Planning: Can't handle the body of the loop because "
-                 "the IfThenElse node has an else branch";
-          current = if_then_else->then_case;
-          continue;
-        }
-        if (const auto *let_stmt = current.as<LetStmtNode>()) {
-          current = let_stmt->body;
-          continue;
-        }
-        LOG(FATAL) << "Pipeline_Planning: Can't handle the body of the loop "
-                   << "because it is not a SeqStmt, IfThenElse without else, "
-                   << "or LetStmt wrapping them, but got "
-                   << current->GetTypeKey();
-      }
+    std::string rejection_reason;
+    pipeline_body_seq =
+        FindPipelineBodySeq(pipeline_body_root, &rejection_reason);
+    if (!pipeline_body_seq.defined()) {
+      return SynchronousFallback(ffi::GetRef<For>(loop), num_stages,
+                                 String(rejection_reason));
     }
-    ICHECK(pipeline_body_seq.defined());
 
-    CHECK(num_stages >= 1);
-    CHECK(loop->kind == ForKind::kSerial);
+    ICHECK_GE(num_stages, 1)
+        << "pipeline num_stages must be a positive integer";
 
     // Flatten nested SeqStmts. TMA copy lowering emits
     // SeqStmt({produce, wait}) which creates nested SeqStmts when placed
@@ -2074,16 +2219,22 @@ private:
       Block new_block(block->iter_vars, block->reads, block->writes,
                       block->name_hint, rebuilt_inner, block->init,
                       block->alloc_buffers, block->match_buffers,
-                      block->annotations);
-      new_loop_body =
-          BlockRealize(realize->iter_values, realize->predicate, new_block);
+                      block->annotations, block->span);
+      new_loop_body = BlockRealize(realize->iter_values, realize->predicate,
+                                   new_block, realize->span);
     } else {
       new_loop_body = RebuildBodyWrapper(loop->body, pipeline_body_seq.value(),
                                          new_body_seq);
     }
 
+    new_loop_body = PipelineTransferOwnershipAnnotator::Annotate(new_loop_body);
+    RecordDecision(num_stages, "software_pipeline",
+                   "dependency graph scheduled with compiler-owned "
+                   "buffer versioning and synchronization",
+                   /*fallback=*/false);
     return For(loop->loop_var, loop->min, loop->extent, loop->kind,
-               new_loop_body, loop->thread_binding, annotations);
+               new_loop_body, loop->thread_binding, annotations, loop->step,
+               loop->span);
   }
 
   Stmt VisitStmt_(const BlockNode *op) final {
@@ -2111,11 +2262,12 @@ private:
       return IfThenElse(
           if_node->condition,
           RebuildBodyWrapper(if_node->then_case, old_seq, new_seq),
-          if_node->else_case);
+          if_node->else_case, if_node->span);
     }
     if (const auto *let_node = current.as<LetStmtNode>()) {
       return LetStmt(let_node->var, let_node->value,
-                     RebuildBodyWrapper(let_node->body, old_seq, new_seq));
+                     RebuildBodyWrapper(let_node->body, old_seq, new_seq),
+                     let_node->span);
     }
     LOG(FATAL) << "RebuildBodyWrapper: unexpected node type "
                << current->GetTypeKey();
@@ -2125,6 +2277,8 @@ private:
   Map<Var, Buffer> buffer_data_to_buffer_;
   Target target_;
   bool use_async_copy_{};
+  int next_pipeline_loop_index_{0};
+  Array<Map<String, ObjectRef>> lowering_decisions_;
 };
 
 tvm::transform::Pass PipelinePlanning() {
@@ -2132,8 +2286,28 @@ tvm::transform::Pass PipelinePlanning() {
   auto pass_func = [=](PrimFunc f, const IRModule &m, PassContext ctx) {
     bool use_async_copy =
         ctx->GetConfig<Bool>("tir.use_async_copy", Bool(true)).value();
+    Array<Map<String, ObjectRef>> decisions;
     PrimFuncNode *fptr = f.CopyOnWrite();
-    fptr->body = PipelinePlanner::Substitute(f, use_async_copy);
+    fptr->body = PipelinePlanner::Substitute(f, &decisions, use_async_copy);
+    if (!decisions.empty()) {
+      if (auto previous = f->GetAttr<Array<Map<String, ObjectRef>>>(
+              kPipelineLoweringDecisions)) {
+        Array<Map<String, ObjectRef>> combined = previous.value();
+        int loop_index_offset = static_cast<int>(combined.size());
+        for (const auto &decision : decisions) {
+          Map<String, ObjectRef> adjusted = decision;
+          const auto *loop_index = decision.at("loop_index").as<IntImmNode>();
+          ICHECK(loop_index != nullptr);
+          adjusted.Set("loop_index",
+                       Integer(loop_index_offset + loop_index->value));
+          combined.push_back(std::move(adjusted));
+        }
+        decisions = std::move(combined);
+      }
+      f = WithAttr(std::move(f), kPipelineDecisionSchemaVersion,
+                   Integer(kPipelineDecisionCurrentSchemaVersion));
+      f = WithAttr(std::move(f), kPipelineLoweringDecisions, decisions);
+    }
     return f;
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.PipelinePlanning", {});
@@ -2141,7 +2315,10 @@ tvm::transform::Pass PipelinePlanning() {
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
-  refl::GlobalDef().def("tl.transform.PipelinePlanning", PipelinePlanning);
+  refl::GlobalDef()
+      .def("tl.transform.PipelinePlanning", PipelinePlanning)
+      .def("tl.PipelineLoweringVersion",
+           []() { return Integer(kPipelineDecisionCurrentSchemaVersion); });
 }
 
 } // namespace tl

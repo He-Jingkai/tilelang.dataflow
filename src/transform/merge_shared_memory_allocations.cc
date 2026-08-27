@@ -40,6 +40,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include "../op/builtin.h"
 #include "../target/utils.h"
@@ -72,13 +73,15 @@ static bool IsStaticSharedMemory(Var buffer_var) {
 /*!
  * \brief collect the mapping from the buffer var to its allocate
  */
-class AllocateCollector : public StmtExprVisitor {
+class SharedMemoryAllocateCollector : public StmtExprVisitor {
 public:
   void VisitStmt_(const AllocateNode *op) final {
     if (IsDynamicSharedMemory(op->buffer_var)) {
       dyn_shmem_allocs_[op->buffer_var.get()] = op;
+      dyn_shmem_alloc_order_.push_back(op->buffer_var);
     } else if (IsStaticSharedMemory(op->buffer_var)) {
       static_shmem_allocs_[op->buffer_var.get()] = op;
+      static_shmem_alloc_order_.push_back(op->buffer_var);
     }
     StmtExprVisitor::VisitStmt_(op);
   }
@@ -87,6 +90,10 @@ public:
   // The static mapping from the original buffer var to its allocate
   std::unordered_map<const VarNode *, const AllocateNode *>
       static_shmem_allocs_;
+  // Structural allocation order is the stable final tie-break for buffers
+  // whose names, lifetimes, and sizes are otherwise identical.
+  std::vector<Var> dyn_shmem_alloc_order_;
+  std::vector<Var> static_shmem_alloc_order_;
 };
 
 // Find a linear pattern of storage access
@@ -449,8 +456,10 @@ public:
   explicit SharedMemoryRewriter(
       const std::unordered_map<const VarNode *, const AllocateNode *>
           &shmem_allocs,
-      bool is_dynamic = true, bool verbose = false, int align_bytes = 0)
-      : is_dynamic_{is_dynamic}, shmem_allocs_{shmem_allocs}, verbose_{verbose},
+      const std::vector<Var> &shmem_alloc_order, bool is_dynamic = true,
+      bool verbose = false, int align_bytes = 0)
+      : is_dynamic_{is_dynamic}, shmem_allocs_{shmem_allocs},
+        shmem_alloc_order_{shmem_alloc_order}, verbose_{verbose},
         align_bytes_{align_bytes} {
     if (!is_dynamic) {
       merged_buf_var_ =
@@ -546,7 +555,7 @@ private:
   }
 
   template <typename Node> Node VisitBufferAccess(Node node) {
-    if (IsAppropriateSharedMemory(node->buffer->data)) {
+    if (IsLocallyAllocatedSharedMemory(node->buffer->data)) {
       ICHECK_EQ(node->indices.size(), 1)
           << "MergeSharedMemoryAllocations expects flat memory buffers, "
           << "and is to be run after "
@@ -570,7 +579,7 @@ private:
       return it->second;
     }
 
-    if (IsAppropriateSharedMemory(buffer->data)) {
+    if (IsLocallyAllocatedSharedMemory(buffer->data)) {
       ICHECK_EQ(buffer->shape.size(), 1)
           << "Buffer " << buffer << " has shape " << buffer->shape << ".  "
           << "MergeSharedMemoryAllocations expects flat memory buffers, "
@@ -589,7 +598,7 @@ private:
       ICHECK_EQ(op->args.size(), 5U);
       DataType dtype = op->args[0].dtype();
       Var buffer = Downcast<Var>(op->args[1]);
-      if (!IsAppropriateSharedMemory(buffer)) {
+      if (!IsLocallyAllocatedSharedMemory(buffer)) {
         return StmtExprMutator::VisitExpr_(op);
       }
       PrimExpr extra_offset = GetBufferOffset(buffer, dtype);
@@ -612,7 +621,7 @@ private:
 
       // tvm_access_ptr(ptype, data, offset, extent, rw_mask)
       Var buffer = Downcast<Var>(dst_access_ptr->args[1]);
-      if (!IsAppropriateSharedMemory(buffer)) {
+      if (!IsLocallyAllocatedSharedMemory(buffer)) {
         return StmtExprMutator::VisitExpr_(op);
       }
 
@@ -656,6 +665,15 @@ private:
     return is_dynamic_ ? IsDynamicSharedMemory(var) : IsStaticSharedMemory(var);
   }
 
+  // Shared-memory parameters are externally owned views (for example, a
+  // caller-provided arena).  Only allocations collected from this PrimFunc
+  // belong to the merged local arena; external views must retain their own
+  // base pointer and offsets.
+  bool IsLocallyAllocatedSharedMemory(const Var &var) {
+    return IsAppropriateSharedMemory(var) &&
+           shmem_allocs_.find(var.get()) != shmem_allocs_.end();
+  }
+
   using StmtEntry = SharedMemLinearAccessPatternFinder::StmtEntry;
   using StmtAttr = SharedMemLinearAccessPatternFinder::StmtAttr;
 
@@ -670,6 +688,7 @@ private:
     int start{0}; // first statement index touching the buf.
     int end{0};   // one-past-last statement index.
     DataType size_dtype{DataType::Int(32)};
+    size_t allocation_order{0};
   };
 
   // Interval describing the liveness window of a (constant-sized) allocation.
@@ -679,6 +698,7 @@ private:
     size_t size_bytes{0};
     int alignment{0};
     const VarNode *var{nullptr};
+    size_t allocation_order{0};
   };
 
   // Result of a linear-scan arena packing.  Offsets contain the byte offset for
@@ -818,8 +838,12 @@ private:
     size_t offset{0};
     size_t size{0};
     const VarNode *var{nullptr};
+    size_t allocation_order{0};
     bool operator>(const ActiveInterval &other) const {
-      return end > other.end;
+      if (end != other.end) {
+        return end > other.end;
+      }
+      return allocation_order > other.allocation_order;
     }
   };
 
@@ -834,7 +858,10 @@ private:
                 if (lhs.size_bytes != rhs.size_bytes) {
                   return lhs.size_bytes > rhs.size_bytes;
                 }
-                return lhs.var->name_hint < rhs.var->name_hint;
+                if (lhs.var->name_hint != rhs.var->name_hint) {
+                  return lhs.var->name_hint < rhs.var->name_hint;
+                }
+                return lhs.allocation_order < rhs.allocation_order;
               });
 
     std::priority_queue<ActiveInterval, std::vector<ActiveInterval>,
@@ -875,7 +902,7 @@ private:
         arena_top = offset + interval.size_bytes;
       }
       active.push(ActiveInterval{interval.end, offset, interval.size_bytes,
-                                 interval.var});
+                                 interval.var, interval.allocation_order});
       offsets[interval.var] = offset;
     }
 
@@ -1240,22 +1267,29 @@ private:
       }
     }
 
-    // Create a sorted vector of keys from shmem_allocs_ for deterministic
-    // iteration
-    std::vector<const VarNode *> sorted_vars;
-    sorted_vars.reserve(shmem_allocs_.size());
-    for (const auto &kv : shmem_allocs_) {
-      sorted_vars.push_back(kv.first);
+    ICHECK_EQ(shmem_alloc_order_.size(), shmem_allocs_.size());
+    std::unordered_map<Var, size_t, ObjectPtrHash, ObjectPtrEqual>
+        allocation_order;
+    allocation_order.reserve(shmem_alloc_order_.size());
+    for (size_t index = 0; index < shmem_alloc_order_.size(); ++index) {
+      allocation_order.emplace(shmem_alloc_order_[index], index);
     }
+    // Preserve the existing name-based order and use structural occurrence
+    // only when duplicate name hints would otherwise compare equal.
+    std::vector<Var> sorted_vars = shmem_alloc_order_;
     std::sort(sorted_vars.begin(), sorted_vars.end(),
-              [](const VarNode *a, const VarNode *b) {
-                return a->name_hint < b->name_hint;
+              [&](const Var &a, const Var &b) {
+                if (a->name_hint != b->name_hint) {
+                  return a->name_hint < b->name_hint;
+                }
+                return allocation_order.at(a) < allocation_order.at(b);
               });
 
     std::vector<BufInfo> buf_infos;
     buf_infos.reserve(shmem_allocs_.size());
     // Build a BufInfo for all allocations that participate in liveness.
-    for (const VarNode *var : sorted_vars) {
+    for (const Var &var_handle : sorted_vars) {
+      const VarNode *var = var_handle.get();
       auto start_it = start_index.find(var);
       if (start_it == start_index.end()) {
         continue;
@@ -1264,6 +1298,7 @@ private:
       BufInfo info;
       info.var = var;
       info.name = var->name_hint;
+      info.allocation_order = allocation_order.at(var_handle);
       info.start = start_it->second;
       info.end = std::max(end_index[var], info.start + 1);
       info.alignment = align_bytes_;
@@ -1309,7 +1344,9 @@ private:
                   return a.start < b.start;
                 if (a.end != b.end)
                   return a.end < b.end;
-                return a.name < b.name;
+                if (a.name != b.name)
+                  return a.name < b.name;
+                return a.allocation_order < b.allocation_order;
               });
 
     std::vector<Interval> intervals;
@@ -1326,6 +1363,7 @@ private:
           std::max<int64_t>(0, info.const_size_bytes.value()));
       interval.alignment = info.alignment;
       interval.var = info.var;
+      interval.allocation_order = info.allocation_order;
       intervals.push_back(interval);
     }
 
@@ -1454,6 +1492,9 @@ private:
                       PointerType(PrimType(DataType::UInt(8)), "shared.dyn")};
   // The mapping from the original buffer var to its allocate
   std::unordered_map<const VarNode *, const AllocateNode *> shmem_allocs_;
+  // Allocation order captured from the source TIR before unordered lookup
+  // tables are constructed.
+  std::vector<Var> shmem_alloc_order_;
   // The size of the merged buffer
   PrimExpr merged_alloc_size_{0};
   // The mapping from the original buffer var to its offset in the merged buffer
@@ -1472,16 +1513,24 @@ private:
 Stmt MergeSharedMemoryAllocations(Stmt stmt, bool merge_static_smem,
                                   bool enable_aggressive_merge,
                                   int align_bytes = 16, bool verbose = false) {
-  AllocateCollector collector;
+  SharedMemoryAllocateCollector collector;
   collector(stmt);
   if (collector.dyn_shmem_allocs_.size() > 1) {
-    SharedMemoryRewriter rewriter(collector.dyn_shmem_allocs_, true, verbose,
-                                  align_bytes);
+    ICHECK_EQ(collector.dyn_shmem_alloc_order_.size(),
+              collector.dyn_shmem_allocs_.size())
+        << "dynamic shared allocation order was not collected";
+    SharedMemoryRewriter rewriter(collector.dyn_shmem_allocs_,
+                                  collector.dyn_shmem_alloc_order_, true,
+                                  verbose, align_bytes);
     rewriter.PlanReuse(stmt, true, enable_aggressive_merge);
     stmt = rewriter(std::move(stmt));
   }
   if (merge_static_smem && collector.static_shmem_allocs_.size() > 1) {
-    SharedMemoryRewriter rewriter(collector.static_shmem_allocs_, false,
+    ICHECK_EQ(collector.static_shmem_alloc_order_.size(),
+              collector.static_shmem_allocs_.size())
+        << "static shared allocation order was not collected";
+    SharedMemoryRewriter rewriter(collector.static_shmem_allocs_,
+                                  collector.static_shmem_alloc_order_, false,
                                   verbose, align_bytes);
     rewriter.PlanReuse(stmt, false, enable_aggressive_merge);
     stmt = rewriter(std::move(stmt));

@@ -48,6 +48,9 @@ namespace tl {
 using namespace ffi;
 namespace tir = tvm::tir;
 
+static constexpr const char *kCrossHandlerHandoffEnabled =
+    "tl.cross_handler_handoff_enabled";
+
 // This pass traverses the AST, split the target function into host part and
 // device part and copies all assume attribute statements to the device side.
 
@@ -69,6 +72,10 @@ public:
 
   void SetClusterDims(Array<Integer> cluster_dims) {
     cluster_dims_ = std::move(cluster_dims);
+  }
+
+  void SetCrossHandlerHandoffEnabled() {
+    cross_handler_handoff_enabled_ = true;
   }
 
   void SetHostFuncSignature(const tir::PrimFunc &func) {
@@ -116,6 +123,7 @@ private:
   Map<tir::Var, tir::Buffer> host_buffer_map_;
   Array<tir::Var> non_restrict_params_;
   Optional<Array<Integer>> cluster_dims_{std::nullopt};
+  bool cross_handler_handoff_enabled_{false};
   Optional<String> code_block_source_{std::nullopt};
   Optional<String> code_block_entry_name_{std::nullopt};
 
@@ -354,6 +362,9 @@ private:
     if (cluster_dims_.defined()) {
       device_attrs.Set("cluster_dims", cluster_dims_.value());
     }
+    if (cross_handler_handoff_enabled_) {
+      device_attrs.Set(kCrossHandlerHandoffEnabled, Integer(1));
+    }
     if (code_block_source_) {
       device_attrs.Set(tl::attr::kCodeBlockSource, code_block_source_.value());
     }
@@ -410,6 +421,12 @@ tir::PrimFunc SplitHostDevice(tir::PrimFunc func, IRModule *device_mod,
   if (auto opt = func->GetAttr<Array<Integer>>("cluster_dims")) {
     splitter.SetClusterDims(opt.value());
     func = tvm::WithoutAttr(std::move(func), "cluster_dims");
+  }
+  // Dynamic register allocation persists across Dataflow handler calls.
+  // Preserve the handoff marker so the post-split register pass can make each
+  // handler invocation independent of the previous handler's warp-group roles.
+  if (func->HasNonzeroAttr(kCrossHandlerHandoffEnabled)) {
+    splitter.SetCrossHandlerHandoffEnabled();
   }
 
   if (auto body = splitter(func->body); !body.same_as(func->body)) {

@@ -77,6 +77,20 @@ def get_param_by_name(func: tvm.tir.PrimFunc, name: str):
     return None
 
 
+def test_split_host_device_preserves_cross_handler_handoff_marker():
+    @T.prim_func
+    def main(a: T.Tensor[(128,), T.int32]):
+        with T.Kernel(1, threads=128):
+            a[0] = 1
+
+    main = main.with_attr("tl.cross_handler_handoff_enabled", 1)
+    mod = run_split_host_device_passes(main)
+    device_func = get_device_func(mod)
+
+    assert device_func is not None
+    assert int(device_func.attrs["tl.cross_handler_handoff_enabled"]) == 1
+
+
 @tilelang.testing.requires_cuda
 def test_split_host_device_with_user_assume():
     """Test that user-defined assumes are correctly copied to device function

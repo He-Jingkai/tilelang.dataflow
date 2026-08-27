@@ -146,6 +146,12 @@ class PassConfigKey(str, Enum):
     TL_DISABLE_WGMMA = "tl.disable_wgmma"
     """Disable usage of Hopper WGMMA. Default: False"""
 
+    TL_DISABLE_LOGICAL_GEMM_PADDING = "tl.disable_logical_gemm_padding"
+    """Disable physical padding for logical GEMM contracts. Default: False"""
+
+    TL_LOGICAL_GEMM_MAX_SHARED_MEMORY_BYTES = "tl.logical_gemm_max_shared_memory_bytes"
+    """Set the shared-memory limit used by logical GEMM planning. Default: unset"""
+
     TL_DEBUG_MERGE_SHARED_MEMORY_ALLOCATIONS = "tl.debug_merge_shared_memory_allocations"
     """Enable debug information for merge shared memory allocations. Default: False"""
 

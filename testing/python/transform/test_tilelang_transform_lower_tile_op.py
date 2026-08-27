@@ -107,5 +107,50 @@ def test_lower_tile_op_respects_parallel_loop_async_annotation_without_pipeline_
     assert calls.get("tir.ptx_wait_group", 0) == 0
 
 
+def test_lower_tile_op_remaps_shared_parameter_buffer_map_for_wgmma():
+    target = tvm.target.Target("cuda -arch=sm_90a")
+
+    @T.prim_func
+    def before(A_handle: T.handle):
+        T.func_attr({"global_symbol": "main", "target": target})
+        A = T.match_buffer(
+            A_handle,
+            (64, 128),
+            dtype="float8_e4m3fn",
+            scope="shared",
+        )
+        T.launch_thread("blockIdx.x", 1)
+        T.launch_thread("threadIdx.x", 128)
+        B = T.alloc_buffer((128, 128), dtype="float8_e4m3fn", scope="shared")
+        C = T.alloc_buffer((64, 128), dtype="float32", scope="local.fragment")
+        T.wgmma_gemm(A, B, C, transpose_B=True)
+
+    original_buffer = next(iter(before.buffer_map.values()))
+    mod = tvm.IRModule.from_expr(before)
+    with target:
+        mod = tl.transform.LayoutInference()(mod)
+        mod = tl.transform.LowerTileOp()(mod)
+
+    lowered = mod["main"]
+    lowered_buffer = next(iter(lowered.buffer_map.values()))
+    access_ptr_vars = []
+
+    def collect_access_ptr_vars(node):
+        if (
+            isinstance(node, tvm.tir.Call)
+            and isinstance(node.op, tvm.ir.Op)
+            and node.op.name == "tir.tvm_access_ptr"
+            and isinstance(node.args[1], tvm.tir.Var)
+            and node.args[1].name == "A"
+        ):
+            access_ptr_vars.append(node.args[1])
+
+    post_order_visit(lowered.body, collect_access_ptr_vars)
+
+    assert not lowered_buffer.data.same_as(original_buffer.data)
+    assert access_ptr_vars
+    assert all(var.same_as(lowered_buffer.data) for var in access_ptr_vars)
+
+
 if __name__ == "__main__":
     tilelang.testing.main()

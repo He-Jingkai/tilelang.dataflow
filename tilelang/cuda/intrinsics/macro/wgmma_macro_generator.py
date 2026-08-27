@@ -47,6 +47,8 @@ class WGMMADescriptorParams:
     """Byte width of a single element: ``DataType(dtype).bits // 8``."""
     is_k_major: bool
     """Whether the matrix is stored in K-major order (affects offset formula branching)."""
+    layout_k_dim: int
+    """K extent of the parent shared-memory layout used by descriptor strides."""
 
 
 class SwizzleMode(IntEnum):
@@ -122,7 +124,9 @@ class TensorCoreIntrinEmitter(MMAIntrinEmitter):
         num_elems_per_byte: int = 1,
         is_m_first: bool | None = False,
         thread_var: Var | None = None,
+        instruction_n: int | None = None,
     ):
+        self._requested_instruction_n = instruction_n
         super().__init__(
             a_dtype,
             b_dtype,
@@ -151,6 +155,10 @@ class TensorCoreIntrinEmitter(MMAIntrinEmitter):
 
     def _initialize_wgmma_prefix(self, n_dim: int = 16):
         inst_m, inst_n = 64, gcd(self.warp_col_tiles, 256)
+        if self._requested_instruction_n is not None:
+            inst_n = self._requested_instruction_n
+            if self.warp_col_tiles % inst_n != 0:
+                raise ValueError(f"instruction_n={inst_n} must divide the per-warpgroup N tile {self.warp_col_tiles}")
         assert inst_n % 8 == 0, (
             f"inst_n must be a multiple of 8, got {inst_n} (block_col_warps={self.block_col_warps}, warp_col_tiles={self.warp_col_tiles})"
         )
@@ -187,8 +195,13 @@ class TensorCoreIntrinEmitter(MMAIntrinEmitter):
         self.micro_size_x = m_dim
         self.micro_size_k = k_dim
 
-    def _determinate_swizzle_mode(self, buffer: Buffer, layout: Layout) -> SwizzleMode:
+    @staticmethod
+    def as_buffer(buffer_or_region: Buffer | BufferRegion) -> Buffer:
+        return buffer_or_region.buffer if isinstance(buffer_or_region, BufferRegion) else buffer_or_region
+
+    def _determinate_swizzle_mode(self, buffer_or_region: Buffer | BufferRegion, layout: Layout) -> SwizzleMode:
         # same behavior to src/layout/gemm_layouts.cc::makeGemmABLayoutHopper
+        buffer = self.as_buffer(buffer_or_region)
         if layout is None or layout.is_equal(make_linear_layout(buffer)):
             return SwizzleMode.NONE
         elif layout.is_equal(make_quarter_bank_swizzled_layout(buffer)):
@@ -201,10 +214,29 @@ class TensorCoreIntrinEmitter(MMAIntrinEmitter):
             raise ValueError(f"Unsupported swizzle mode: {layout}")
 
     def wgmma(
-        self, A_region: BufferRegion, B_region: BufferRegion, C_region: BufferRegion, clear_accum: PrimExpr = False, wg_wait: int = 0
+        self,
+        A_region: BufferRegion,
+        B_region: BufferRegion,
+        C_region: BufferRegion,
+        clear_accum: PrimExpr = False,
+        wg_wait: int = 0,
+        emit_arrive: bool = True,
+        emit_commit: bool = True,
+        emit_fence_before: bool = True,
+        emit_fence_after: bool = True,
     ):
         if is_fragment(A_region):
-            return self.wgmma_rs(A_region, B_region, C_region, clear_accum, wg_wait)
+            return self.wgmma_rs(
+                A_region,
+                B_region,
+                C_region,
+                clear_accum,
+                wg_wait,
+                emit_arrive,
+                emit_commit,
+                emit_fence_before,
+                emit_fence_after,
+            )
 
         k_dim = self.chunk
         micro_size_k = self.micro_size_k
@@ -225,23 +257,36 @@ class TensorCoreIntrinEmitter(MMAIntrinEmitter):
             desc_b = T.alloc_wgmma_desc()
             self.init_wgmma_a_desc(desc_a, A_region, a_params)
             self.init_wgmma_b_desc(desc_b, B_region, b_params)
-            self.wgmma_fence_c(C_buf)
-            self.wgmma_arrive()
+            if emit_fence_before:
+                self.wgmma_fence_c(C_buf)
+            if emit_arrive:
+                self.wgmma_arrive()
 
             for j in T.unroll(num_inst_n):
                 for i in T.unroll(num_inst_m):
                     for ki in T.unroll(num_k_atoms):
                         self.wgmma_ss_atom(desc_a, desc_b, C_buf, i, j, ki, a_params, b_params, clear_accum)
 
-            self.wgmma_commit()
+            if emit_commit:
+                self.wgmma_commit()
             if wg_wait >= 0:
                 self.wgmma_wait(wg_wait)
-            self.wgmma_fence_c(C_buf)
+            if emit_fence_after:
+                self.wgmma_fence_c(C_buf)
 
         return _warp_mma(C_buf)
 
     def wgmma_rs(
-        self, A_region: BufferRegion, B_region: BufferRegion, C_region: BufferRegion, clear_accum: PrimExpr = False, wg_wait: int = 0
+        self,
+        A_region: BufferRegion,
+        B_region: BufferRegion,
+        C_region: BufferRegion,
+        clear_accum: PrimExpr = False,
+        wg_wait: int = 0,
+        emit_arrive: bool = True,
+        emit_commit: bool = True,
+        emit_fence_before: bool = True,
+        emit_fence_after: bool = True,
     ):
         k_dim = self.chunk
         micro_size_k = self.micro_size_k
@@ -261,22 +306,108 @@ class TensorCoreIntrinEmitter(MMAIntrinEmitter):
         def _warp_mma(A_buf, C_buf):
             desc_b = T.alloc_wgmma_desc()
             self.init_wgmma_b_desc(desc_b, B_region, b_params)
-            self.wgmma_fence_a(A_buf)
-            self.wgmma_fence_c(C_buf)
-            self.wgmma_arrive()
+            if emit_fence_before:
+                self.wgmma_fence_a(A_buf)
+                self.wgmma_fence_c(C_buf)
+            if emit_arrive:
+                self.wgmma_arrive()
 
             for j in T.unroll(0, num_inst_n):
                 for i in T.unroll(num_inst_m):
                     for ki in T.unroll(0, num_k_atoms):
                         self.wgmma_rs_atom(A_buf, desc_b, C_buf, i, j, ki, b_params, clear_accum)
 
-            self.wgmma_commit()
+            if emit_commit:
+                self.wgmma_commit()
             if wg_wait >= 0:
                 self.wgmma_wait(wg_wait)
-            self.wgmma_fence_c(C_buf)
-            self.wgmma_fence_a(A_buf)
+            if emit_fence_after:
+                self.wgmma_fence_c(C_buf)
+                self.wgmma_fence_a(A_buf)
 
         return _warp_mma(A_buf, C_buf)
+
+    def wgmma_shared_a_rs(
+        self,
+        A_region: BufferRegion,
+        B_region: BufferRegion,
+        C_region: BufferRegion,
+        logical_m: int,
+        clear_accum: PrimExpr = False,
+    ):
+        """Stream a logical-M shared A operand through a bounded RS ring.
+
+        Hopper still executes physical m64 WGMMA instructions.  Each warp owns
+        one 16-row A tile; rows outside ``logical_m`` are injected as register
+        zeros instead of being materialized in shared memory.
+        """
+        if self.a_transposed:
+            raise ValueError("shared-A RS WGMMA requires K-major A")
+        if not is_full_region(C_region):
+            raise ValueError("Fragment output C must be a full region")
+
+        num_inst_m = self.wgmma_num_inst_m
+        num_inst_n = self.wgmma_num_inst_n
+        num_k_atoms = self.wgmma_num_k_atoms
+        # Two K atoms share one commit group.  The four-stage register ring
+        # therefore keeps two groups in flight and waits before reusing either
+        # group's source registers.  This reduces commit/wait issue overhead
+        # without extending any shared-memory lifetime.
+        commit_atoms = min(2, num_k_atoms)
+        ring_stages = min(2 * commit_atoms, num_k_atoms)
+        stage_elems = self.warp_rows * self.local_size_a
+        stage_regs = (stage_elems * DataType(self.a_dtype).bits + 31) // 32
+        ring_regs = ring_stages * stage_regs
+        b_params = self.compute_wgmma_b_desc_params(B_region)
+        A_buf = A_region.buffer
+        C_buf = C_region.buffer
+        a_dtype = self.a_dtype
+
+        @T.macro
+        def warp_mma(A_buf, C_buf):
+            A_ring = T.alloc_local((ring_stages * stage_elems,), a_dtype)
+            desc_b = T.alloc_wgmma_desc()
+            self.init_wgmma_b_desc(desc_b, B_region, b_params)
+            self.wgmma_fence_c(C_buf)
+
+            for ki in T.unroll(num_k_atoms):
+                if ki >= ring_stages and ki % commit_atoms == 0:
+                    self.wgmma_wait(ring_stages // commit_atoms - 1)
+                stage = ki % ring_stages
+                self.ldmatrix_a(
+                    A_ring,
+                    A_region,
+                    ki,
+                    local_offset=stage * stage_elems,
+                    logical_rows=logical_m,
+                )
+                T.warpgroup_fence_operand(
+                    A_ring,
+                    offset=stage * stage_elems,
+                    num_regs=stage_regs,
+                )
+                self.wgmma_arrive()
+                for j in T.unroll(num_inst_n):
+                    for i in T.unroll(num_inst_m):
+                        self.wgmma_rs_atom(
+                            A_ring,
+                            desc_b,
+                            C_buf,
+                            i,
+                            j,
+                            ki,
+                            b_params,
+                            clear_accum,
+                            a_ki=stage,
+                        )
+                if (ki + 1) % commit_atoms == 0 or ki + 1 == num_k_atoms:
+                    self.wgmma_commit()
+
+            self.wgmma_wait(0)
+            self.wgmma_fence_c(C_buf)
+            T.warpgroup_fence_operand(A_ring, num_regs=ring_regs)
+
+        return warp_mma(A_buf, C_buf)
 
     # ---- Atom-level interface ----
 
@@ -312,18 +443,25 @@ class TensorCoreIntrinEmitter(MMAIntrinEmitter):
 
     # -- Descriptor parameter computation (pure Python, no TIR) --
 
-    def compute_wgmma_b_desc_params(self, B_region: BufferRegion) -> WGMMADescriptorParams:
+    def compute_wgmma_b_desc_params(self, B_region: Buffer | BufferRegion) -> WGMMADescriptorParams:
         """Compute B descriptor parameters from the B shared buffer region.
 
         This is a pure-Python helper -- no TIR code is emitted.
         The returned ``WGMMADescriptorParams`` is passed to
         ``init_wgmma_b_desc()`` and ``wgmma_*_atom()`` methods.
         """
+        B_buffer = self.as_buffer(B_region)
         n_dim = self.block_col_warps * self.warp_col_tiles
         k_dim = self.chunk
         micro_size_k = self.micro_size_k
         elems_in_bytes = DataType(self.a_dtype).bits // 8
         b_is_k_major = self.b_transposed
+        layout_k_dim = k_dim
+        if not b_is_k_major:
+            try:
+                layout_k_dim = int(B_buffer.shape[-2])
+            except (TypeError, ValueError):
+                layout_k_dim = k_dim
 
         b_swizzle_mode = self._determinate_swizzle_mode(B_region, self.b_shared_layout)
         b_swizzle_atom_elems = n_dim if b_swizzle_mode.is_none() else b_swizzle_mode.swizzle_byte_size() // elems_in_bytes
@@ -339,7 +477,7 @@ class TensorCoreIntrinEmitter(MMAIntrinEmitter):
                 if b_n_axis_atoms <= 1:
                     b_leading_byte_offset = 0
                 else:
-                    b_leading_byte_offset = 8 * 8 * elems_in_bytes * k_dim
+                    b_leading_byte_offset = 8 * 8 * elems_in_bytes * layout_k_dim
                 if b_n_axis_atoms <= 1:
                     b_stride_byte_offset = 8 * elems_in_bytes * n_dim
                 else:
@@ -353,9 +491,10 @@ class TensorCoreIntrinEmitter(MMAIntrinEmitter):
             k_atom_size=max(b_swizzle_atom_elems // micro_size_k, 1),
             elems_in_bytes=elems_in_bytes,
             is_k_major=b_is_k_major,
+            layout_k_dim=layout_k_dim,
         )
 
-    def compute_wgmma_a_desc_params(self, A_region: BufferRegion) -> WGMMADescriptorParams:
+    def compute_wgmma_a_desc_params(self, A_region: Buffer | BufferRegion) -> WGMMADescriptorParams:
         """Compute A descriptor parameters from the A shared buffer region (SS variant).
 
         This is a pure-Python helper -- no TIR code is emitted.
@@ -396,6 +535,7 @@ class TensorCoreIntrinEmitter(MMAIntrinEmitter):
             k_atom_size=max(a_swizzle_atom_elems // micro_size_k, 1),
             elems_in_bytes=elems_in_bytes,
             is_k_major=a_is_k_major,
+            layout_k_dim=k_dim,
         )
 
     # -- Descriptor initialization (emit TIR) --
@@ -517,6 +657,7 @@ class TensorCoreIntrinEmitter(MMAIntrinEmitter):
         ki: int,
         b_params: WGMMADescriptorParams,
         clear_accum: PrimExpr = False,
+        a_ki: int | PrimExpr | None = None,
     ):
         """Emit a single WGMMA RS instruction for atom ``(inst_m_idx, inst_n_idx, ki)``.
 
@@ -552,7 +693,6 @@ class TensorCoreIntrinEmitter(MMAIntrinEmitter):
         warp_cols = self.warp_cols
         micro_size_k = self.micro_size_k
         n_dim = self.block_col_warps * self.warp_col_tiles
-        k_dim = self.chunk
         wgmma_inst_n = self.wgmma_inst_n
         num_inst_n = self.wgmma_num_inst_n
         a_dtype_abbrv = self.a_dtype_abbrv
@@ -564,10 +704,13 @@ class TensorCoreIntrinEmitter(MMAIntrinEmitter):
         elems_in_bytes = b_params.elems_in_bytes
         bk_atom_size = b_params.k_atom_size
         b_swizzle_atom_elems = b_params.swizzle_atom_elems
+        b_layout_k_dim = b_params.layout_k_dim
 
         thread_binding = self.get_thread_binding()
 
-        A_offset = ki * warp_rows * local_size_a + inst_m_idx * local_size_a
+        if a_ki is None:
+            a_ki = ki
+        A_offset = a_ki * warp_rows * local_size_a + inst_m_idx * local_size_a
         C_offset = inst_m_idx * warp_cols * local_size_out + inst_n_idx * warp_cols * local_size_out // num_inst_n
 
         @T.macro
@@ -582,7 +725,8 @@ class TensorCoreIntrinEmitter(MMAIntrinEmitter):
                 + (ki % bk_atom_size) * micro_size_k
                 if b_params.is_k_major
                 else (
-                    ki * b_swizzle_atom_elems * micro_size_k + warp_j * wgmma_inst_n * (k_dim if n_dim // b_swizzle_atom_elems > 1 else 1)
+                    ki * b_swizzle_atom_elems * micro_size_k
+                    + warp_j * wgmma_inst_n * (b_layout_k_dim if n_dim // b_swizzle_atom_elems > 1 else 1)
                 )
             )
 
@@ -665,6 +809,7 @@ class TensorCoreIntrinEmitter(MMAIntrinEmitter):
         bk_atom_size = b_params.k_atom_size
         a_swizzle_atom_elems = a_params.swizzle_atom_elems
         b_swizzle_atom_elems = b_params.swizzle_atom_elems
+        b_layout_k_dim = b_params.layout_k_dim
 
         thread_binding = self.get_thread_binding()
 
@@ -690,7 +835,8 @@ class TensorCoreIntrinEmitter(MMAIntrinEmitter):
                 + warp_j * wgmma_inst_n * b_swizzle_atom_elems
                 if b_is_k_major
                 else (
-                    ki * b_swizzle_atom_elems * micro_size_k + warp_j * wgmma_inst_n * (k_dim if n_dim // b_swizzle_atom_elems > 1 else 1)
+                    ki * b_swizzle_atom_elems * micro_size_k
+                    + warp_j * wgmma_inst_n * (b_layout_k_dim if n_dim // b_swizzle_atom_elems > 1 else 1)
                 )
             )
 

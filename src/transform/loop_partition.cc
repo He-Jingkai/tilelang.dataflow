@@ -103,6 +103,9 @@ For PartitionLoop(For op, Var thread_var, arith::Analyzer *analyzer,
   }
   // substitute and re-construct the serial loop
   body = Substitute(body, vmap);
+  if (has_thread_offset) {
+    body = Substitute(body, thread_offset_map);
+  }
   // Guard executes the recovered loop body only if each inverse-mapped iterator
   // falls back into the original For ranges. We first check every axis from the
   // old loop nest (old_loop_depth) and then the extra index produced by inverse
@@ -158,9 +161,6 @@ For PartitionLoop(For op, Var thread_var, arith::Analyzer *analyzer,
 
   body = BufferIndiceSimplify(analyzer)(body);
 
-  if (has_thread_offset) {
-    body = Substitute(body, thread_offset_map);
-  }
   return Downcast<For>(body);
 }
 

@@ -105,6 +105,11 @@ CopyInstSelection ClassifyWarpSpecializedProducerCopy(const CopyNode &op,
 // information without knowing the CUDA lowering policy knobs.
 bool IsPipelineManagedCPAsyncCopy(const CopyNode &op, Target target);
 
+// Structured resolution for the public transfer-lowering registry.
+TransferLoweringPlan
+ResolveCudaTransferLowering(const CopyNode &op,
+                            const TransferLoweringContext &context);
+
 } // namespace cuda
 } // namespace tl
 } // namespace tvm
