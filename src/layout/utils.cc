@@ -432,13 +432,55 @@ bool ProveFragmentContains(Fragment small_frag, Fragment large_frag,
                 Range(IntImm(small_frag->ReplicateExtent()->dtype, 0),
                       small_frag->ReplicateExtent()),
                 true); // Bind the replicate extent of small_frag.
-  // Derive thread for small_frag.
-  auto thread = small_frag->ForwardThread(small_frag_indices, rep_small);
+  auto range_min = [](const Fragment &fragment) -> PrimExpr {
+    auto range = fragment->ThreadRange();
+    if (range.defined()) {
+      return range->min;
+    }
+    return Integer(0);
+  };
+
+  // Derive the global thread for small_frag.  BindThreadRange stores the CTA
+  // thread interval separately from the fragment's local forward_thread
+  // formula, so comparisons across warpgroup sub-ranges must account for the
+  // interval min explicitly.
+  auto small_range_min = range_min(small_frag);
+  auto large_range_min = range_min(large_frag);
+
+  // A direct ownership proof avoids needlessly inverting floor/mod-heavy
+  // layouts. This is common when one loop consumes multiple register values
+  // that intentionally share a thread, such as gran-8 interleaved WGMMA
+  // accumulators. The fast path is exact: if symbolic equality cannot be
+  // proven, retain the general inverse-layout proof below.
+  if (!check_forward_index &&
+      analyzer.CanProveEqual(small_frag->ReplicateExtent(),
+                             large_frag->ReplicateExtent())) {
+    Var direct_rep("__checking_frag_contains_direct_rep");
+    analyzer.Bind(direct_rep,
+                  Range(IntImm(small_frag->ReplicateExtent()->dtype, 0),
+                        small_frag->ReplicateExtent()),
+                  true);
+    PrimExpr small_thread = analyzer.Simplify(
+        small_frag->ForwardThread(small_frag_indices, direct_rep) +
+        small_range_min);
+    PrimExpr large_thread = analyzer.Simplify(
+        large_frag->ForwardThread(large_frag_indices, direct_rep) +
+        large_range_min);
+    if (analyzer.CanProveEqual(small_thread, large_thread)) {
+      return true;
+    }
+  }
+
+  auto thread = analyzer.Simplify(
+      small_frag->ForwardThread(small_frag_indices, rep_small) +
+      small_range_min);
 
   // Get physical index and thread for large_frag.
   auto large_frag_physical_and_thread = large_frag->Forward(large_frag_indices);
-  // Add small_frag's thread to the large fragment's thread info.
-  large_frag_physical_and_thread.push_back(thread);
+  // Add small_frag's thread in large_frag's local thread coordinate to the
+  // large fragment's thread info.
+  large_frag_physical_and_thread.push_back(
+      analyzer.Simplify(thread - large_range_min));
   // Get the inverse of the large fragment.
   auto inv_large_frag = large_frag->Inverse();
   // Compute logical index and replicate index using inverse layout.
@@ -450,8 +492,9 @@ bool ProveFragmentContains(Fragment small_frag, Fragment large_frag,
       inv_large_frag_logical_and_rep[inv_large_frag_logical_and_rep.size() - 1];
 
   // Calculate thread based on the logical index and replicate index.
-  auto check_thread =
-      large_frag->ForwardThread(large_frag_indices, inv_large_frag_rep);
+  auto check_thread = analyzer.Simplify(
+      large_frag->ForwardThread(large_frag_indices, inv_large_frag_rep) +
+      large_range_min);
 
   // Simplify the difference between the threads.
   auto diff = analyzer.Simplify(thread - check_thread);

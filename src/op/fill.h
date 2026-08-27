@@ -20,6 +20,7 @@ public:
   tir::Buffer dst;     ///< Destination buffer to fill
   PrimExpr value;      ///< Value to fill with
   Array<Range> region; ///< Region to fill within the buffer
+  bool predicated_partition{false};
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.Fill", FillNode, TileOperatorNode);
 
   Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;
@@ -32,13 +33,16 @@ public:
     refl::ObjectDef<FillNode>()
         .def_ro("dst", &FillNode::dst)
         .def_ro("value", &FillNode::value)
-        .def_ro("region", &FillNode::region);
+        .def_ro("region", &FillNode::region)
+        .def_ro("predicated_partition", &FillNode::predicated_partition);
   }
 
   TileOperator Clone() const;
 
   /// Create SIMT-style parallel loop for filling
-  For MakeSIMTLoop(arith::Analyzer *analyzer) const;
+  For MakeSIMTLoop(arith::Analyzer *analyzer,
+                   Optional<PrimExpr> partition_extent = Optional<PrimExpr>(),
+                   bool iterate_full_buffer = false) const;
 };
 
 using FillTargetPredicate = bool (*)(Target target);

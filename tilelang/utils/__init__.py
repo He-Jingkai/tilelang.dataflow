@@ -5,6 +5,12 @@ from .target import (  # noqa: F401
     determine_fp8_type,
     determine_torch_fp8_type,
 )
+from .target_capabilities import (  # noqa: F401
+    TargetCapabilityResolutionError,
+    TargetCapabilitySnapshot,
+    resolve_target_capabilities,
+    target_capability_override,
+)
 from .tensor import TensorSupplyType, torch_assert_close  # noqa: F401
 from .language import (
     is_global,  # noqa: F401

@@ -10,12 +10,14 @@
 #include <tvm/tir/stmt_functor.h>
 
 #include <functional>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "../layout/layout.h"
 #include "../op/builtin.h"
+#include "../op/copy.h"
 #include "../op/operator.h"
 #include "../op/region.h"
 #include "../op/utils.h"
@@ -28,6 +30,19 @@ namespace tl {
 using namespace tir;
 
 namespace {
+
+bool IsStreamedClusterPush(const CopyNode *copy) {
+  if (copy == nullptr || !copy->dst_block.defined() ||
+      copy->src_block.defined() ||
+      !copy->annotations.count(kResharedCreditTargetRank) ||
+      !copy->annotations.count(kResharedReceiveStages)) {
+    return false;
+  }
+  auto family = copy->annotations.Get(kResharedTransportFamily);
+  const auto *value =
+      family.has_value() ? family.value().as<StringImmNode>() : nullptr;
+  return value != nullptr && value->value == kResharedTransportStreamed;
+}
 
 bool ShapesEqual(const Array<PrimExpr> &lhs, const Array<PrimExpr> &rhs,
                  arith::Analyzer *analyzer) {
@@ -136,6 +151,12 @@ public:
           call->op.same_as(tma_load_multicast())) {
         role = Role::kProducer;
         has_bulk_copy_ = true;
+      } else {
+        auto tile_op = ParseOperator(ffi::GetRef<Call>(call));
+        if (IsStreamedClusterPush(tile_op.as<CopyNode>())) {
+          role = Role::kProducer;
+          has_bulk_copy_ = true;
+        }
       }
     }
     SetRole(op, role);
@@ -227,11 +248,67 @@ public:
       rewriter.buffer_data_to_buffer_.Set(buffer_var, buffer);
     }
     f.CopyOnWrite()->body = rewriter(f->body);
+    if (!f->buffer_map.empty()) {
+      Map<Var, Buffer> buffer_map = f->buffer_map;
+      bool changed = false;
+      for (const auto &[param, buffer] : f->buffer_map) {
+        Optional<Buffer> remapped;
+        for (const auto &[old_buffer, new_buffer] : rewriter.buffer_remap_) {
+          if (old_buffer->data.same_as(buffer->data)) {
+            remapped = new_buffer;
+            break;
+          }
+        }
+        if (!remapped.defined())
+          continue;
+        buffer_map.Set(param, remapped.value());
+        changed = true;
+      }
+      if (changed) {
+        f.CopyOnWrite()->buffer_map = std::move(buffer_map);
+      }
+    }
     return f;
   }
 
 private:
   explicit MultiVersionBufferRewriter() = default;
+
+  static std::unordered_map<Var, int, ObjectPtrHash, ObjectPtrEqual>
+  CollectRequestedBufferVersions(const Stmt &pipeline_body, int num_stages) {
+    class Collector : public StmtExprVisitor {
+    public:
+      explicit Collector(int num_stages) : num_stages_(num_stages) {}
+
+      void VisitExpr_(const CallNode *op) final {
+        auto tile_op = ParseOperator(ffi::GetRef<Call>(op));
+        if (const auto *copy = tile_op.as<CopyNode>()) {
+          if (auto annotation =
+                  copy->annotations.Get(kPipelineBufferVersions)) {
+            const auto *value = annotation.value().as<IntImmNode>();
+            ICHECK(value != nullptr && value->value > 0 &&
+                   value->value <= num_stages_)
+                << kPipelineBufferVersions
+                << " must be a compile-time positive integer no greater than "
+                   "the pipeline stage count";
+            int versions = static_cast<int>(value->value);
+            auto [it, inserted] = versions_.emplace(copy->dst->data, versions);
+            ICHECK(inserted || it->second == versions)
+                << "pipeline copies targeting one buffer disagree on "
+                << kPipelineBufferVersions;
+          }
+        }
+        StmtExprVisitor::VisitExpr_(op);
+      }
+
+      std::unordered_map<Var, int, ObjectPtrHash, ObjectPtrEqual> versions_;
+
+    private:
+      int num_stages_;
+    } collector(num_stages);
+    collector(pipeline_body);
+    return std::move(collector.versions_);
+  }
 
   Array<Buffer> GetVersionedBuffers(const Array<Stmt> &seq_stmt,
                                     const Array<Buffer> &scoped_buffers) {
@@ -509,25 +586,46 @@ private:
   }
 
   void EnsureVersionedBuffers(const Array<Buffer> &versioned_buffers,
-                              int num_stages) {
+                              int num_stages, const Stmt &pipeline_body) {
+    auto requested_versions =
+        CollectRequestedBufferVersions(pipeline_body, num_stages);
     for (const Buffer &buffer : versioned_buffers) {
       if (buffer_remap_.count(buffer)) {
         continue;
       }
+      int num_versions = num_stages;
+      if (buffer.scope() != "shared.barrier") {
+        auto requested = requested_versions.find(buffer->data);
+        if (requested != requested_versions.end()) {
+          num_versions = requested->second;
+        }
+      }
+      if (num_versions <= 1) {
+        continue;
+      }
       Var buffer_var = buffer->data;
-      Buffer new_buffer = RewriteAllocBuffer(buffer, num_stages);
+      Buffer new_buffer = RewriteAllocBuffer(buffer, num_versions);
       buffer_remap_.Set(buffer, new_buffer);
+      buffer_num_versions_.emplace(buffer, num_versions);
+      buffer_num_versions_.emplace(new_buffer, num_versions);
       if (!buffer_data_to_buffer_.count(buffer_var)) {
         buffer_data_to_buffer_.Set(buffer_var, buffer);
       }
     }
   }
 
-  PrimExpr CurrentVersionIndex() const {
+  PrimExpr CurrentVersionIndex(const Buffer &buffer) const {
+    auto versions = buffer_num_versions_.find(buffer);
+    ICHECK(versions != buffer_num_versions_.end());
+    PrimExpr linear_index;
     if (!explicit_version_index_stack_.empty()) {
-      return explicit_version_index_stack_.back();
+      linear_index = explicit_version_index_stack_.back();
+    } else {
+      linear_index = linear_index_;
     }
-    return version_index_;
+    ICHECK(linear_index.defined())
+        << "Versioned buffer access escaped pipeline stage context";
+    return FloorMod(linear_index, versions->second);
   }
 
   PrimExpr CurrentParityCycle() const {
@@ -620,7 +718,7 @@ private:
       if (const int64_t *imm = as_const_int(op->value)) {
         int num_stages = static_cast<int>(*imm);
         EnsureVersionedBuffers(SelectVersionedBuffers(op->body, num_stages),
-                               num_stages);
+                               num_stages, op->body);
       }
     } else if (op->attr_key == kPipelineMVBStageExpr) {
       explicit_version_index_stack_.push_back(op->value);
@@ -661,18 +759,18 @@ private:
 
     int num_stages = num_stages_anno.value()->value;
     EnsureVersionedBuffers(SelectVersionedBuffers(op->body, num_stages),
-                           num_stages);
+                           num_stages, op->body);
 
     PrimExpr linear_index = loop_stack_[0].first;
     for (size_t i = 1; i < loop_stack_.size(); ++i) {
       linear_index =
           linear_index * loop_stack_[i].second + loop_stack_[i].first;
     }
-    PrimExpr old_version_index = version_index_;
+    PrimExpr old_linear_index = linear_index_;
     PrimExpr old_parity_cycle = parity_cycle_;
     Var old_pipeline_loop_var = pipeline_loop_var_;
     PrimExpr old_pipeline_loop_min = pipeline_loop_min_;
-    version_index_ = FloorMod(linear_index, num_stages);
+    linear_index_ = linear_index;
     // Parity cycles every num_stages iterations for mbarrier phase tracking.
     parity_cycle_ = FloorMod(FloorDiv(linear_index, num_stages), 2);
     // Store the pipelined loop variable and its min value so we can compute
@@ -680,7 +778,7 @@ private:
     pipeline_loop_var_ = op->loop_var;
     pipeline_loop_min_ = op->min;
     auto for_node = StmtExprMutator::VisitStmt_(op);
-    version_index_ = old_version_index;
+    linear_index_ = old_linear_index;
     parity_cycle_ = old_parity_cycle;
     pipeline_loop_var_ = old_pipeline_loop_var;
     pipeline_loop_min_ = old_pipeline_loop_min;
@@ -698,9 +796,7 @@ private:
     }
     Buffer old_buffer = load->buffer;
     const Buffer &new_buffer = (*it).second;
-    PrimExpr version_index = CurrentVersionIndex();
-    ICHECK(version_index.defined())
-        << "Versioned buffer load escaped pipeline stage context";
+    PrimExpr version_index = CurrentVersionIndex(old_buffer);
     auto *n = load.CopyOnWrite();
     n->buffer = new_buffer;
     if (old_buffer.scope() == "shared.barrier") {
@@ -720,9 +816,7 @@ private:
     }
     Buffer old_buffer = store->buffer;
     const Buffer &new_buffer = (*it).second;
-    PrimExpr version_index = CurrentVersionIndex();
-    ICHECK(version_index.defined())
-        << "Versioned buffer store escaped pipeline stage context";
+    PrimExpr version_index = CurrentVersionIndex(old_buffer);
     auto *n = store.CopyOnWrite();
     n->buffer = new_buffer;
     if (old_buffer.scope() == "shared.barrier") {
@@ -784,9 +878,7 @@ private:
           PrimExpr init_orig = call->args[1];
           PrimExpr init_cycle = parity_cycle;
           if (!explicit_parity_cycle_stack_.empty()) {
-            PrimExpr version_index = CurrentVersionIndex();
-            ICHECK(version_index.defined())
-                << "Explicit parity rewrite requires a version index";
+            PrimExpr version_index = CurrentVersionIndex(load->buffer);
             init_cycle = version_index;
           }
           if (pipeline_loop_var_.defined()) {
@@ -831,9 +923,7 @@ private:
       const Buffer &buffer = buffer_data_to_buffer_[buffer_var];
       auto it = buffer_remap_.find(buffer);
       if (it != buffer_remap_.end()) {
-        PrimExpr version_index = CurrentVersionIndex();
-        ICHECK(version_index.defined())
-            << "Versioned access_ptr escaped pipeline stage context";
+        PrimExpr version_index = CurrentVersionIndex(buffer);
         const Buffer &new_buffer = (*it).second;
         const PrimExpr &old_index = call->args[i + 1];
         PrimExpr offset;
@@ -849,7 +939,7 @@ private:
     return Call(call->dtype, call->op, new_args, call->annotations, call->span);
   }
 
-  PrimExpr version_index_;
+  PrimExpr linear_index_;
   PrimExpr parity_cycle_; // (k / num_stages) % 2 for mbarrier parity rewriting
   Var pipeline_loop_var_; // loop variable of the pipelined loop
   PrimExpr pipeline_loop_min_; // min value of the pipelined loop
@@ -862,6 +952,8 @@ private:
   Map<Var, Buffer> buffer_data_to_buffer_;
   Map<Buffer, Optional<Stmt>> buffer_lca_;
   Map<Buffer, Buffer> buffer_remap_;
+  std::unordered_map<Buffer, int, ObjectPtrHash, ObjectPtrEqual>
+      buffer_num_versions_;
   // Remember each block's alloc list so the loop can see buffers defined in
   // parents.
   std::unordered_map<const BlockNode *, Array<Buffer>> block_alloc_buffers_;

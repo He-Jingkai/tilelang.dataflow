@@ -148,6 +148,59 @@ def test_rmw_same_buffer_different_indices():
     assert "a_local_cast_1" in text, "Expected second cast buffer for a[i+32]"
 
 
+def test_cp_async_vectorized_body_is_not_decoupled():
+    """cp.async pointer BufferLoads are addresses and must not get cast buffers."""
+
+    @T.prim_func
+    def before(a: T.Tensor[(16,), T.float16]):
+        s = T.alloc_shared((16,), T.float16)
+        for i in T.vectorized(8):
+            T.ptx_cp_async(
+                T.access_ptr(s[i], "w", 1),
+                T.access_ptr(a[i], "r", 1),
+                1,
+                T.cast(i < 7, "bool"),
+            )
+
+    @T.prim_func
+    def after(a: T.Tensor[(16,), T.float16]):
+        s = T.alloc_shared((16,), T.float16)
+        for i in T.vectorized(8):
+            T.ptx_cp_async(
+                T.access_ptr(s[i], "w", 1),
+                T.access_ptr(a[i], "r", 1),
+                1,
+                T.cast(i < 7, "bool"),
+            )
+
+    _check(before, after)
+
+
+def test_if_then_else_vectorized_store_value_keeps_mutated_expr():
+    """Call fallback in AccessReplacer must return the rebuilt expression."""
+
+    @T.prim_func
+    def before(a: T.Tensor[(16,), T.float32], b: T.Tensor[(16,), T.float8_e4m3fn]):
+        for i in T.vectorized(8):
+            b[i] = T.if_then_else(i < 7, a[i], T.float32(0))
+
+    @T.prim_func
+    def after(a: T.Tensor[(16,), T.float32], b: T.Tensor[(16,), T.float8_e4m3fn]):
+        a_local_cast = T.decl_buffer((8,), T.float32, scope="local")
+        b_local_cast = T.decl_buffer((8,), T.float8_e4m3fn, scope="local")
+        for i_copy in T.vectorized(8):
+            a_local_cast[i_copy] = a[i_copy]
+        for i in T.vectorized(8):
+            b_local_cast[i] = T.cast(
+                T.if_then_else(i < 7, a_local_cast[i], T.float32(0)),
+                T.float8_e4m3fn,
+            )
+        for i_copy in T.vectorized(8):
+            b[i_copy] = b_local_cast[i_copy]
+
+    _check(before, after)
+
+
 def test_local_to_memory_with_let_stmt():
     """Test local → memory transform still triggers through LetStmt-bound loads."""
 

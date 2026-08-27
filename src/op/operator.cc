@@ -31,7 +31,11 @@ using namespace tir;
  */
 TileOperator ParseOperator(Call call) {
   auto op_map = Op::GetAttrMap<OpBuilderFunc>("TLOpBuilder");
-  Op op = call->op.as<Op>().value();
+  Optional<Op> op_ref = call->op.as<Op>();
+  if (!op_ref.defined()) {
+    return TileOperator();
+  }
+  Op op = op_ref.value();
   if (op_map.count(op)) {
     auto tile_op = op_map[op](call->args, call->annotations);
     ICHECK(tile_op.defined());
@@ -89,6 +93,14 @@ Var GetVarFromAccessPtr(const PrimExpr &expr) {
   LOG(FATAL) << "GetVarFromAccessPtr expects a tvm_access_ptr or tl.access_ptr "
                 "call, but got: "
              << tvm::ffi::GetRef<Call>(call);
+}
+
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = tvm::ffi::reflection;
+  refl::GlobalDef().def("tl.ParseOperator", [](Call call) {
+    TileOperator op = ParseOperator(std::move(call));
+    return op.defined() ? Optional<TileOperator>(op) : Optional<TileOperator>();
+  });
 }
 
 } // namespace tl

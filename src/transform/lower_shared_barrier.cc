@@ -71,6 +71,7 @@ private:
     }
 
     ICHECK(thread_var_.defined()) << "thread_var_ is not defined";
+    ICHECK(thread_extent_.defined()) << "thread_extent_ is not defined";
 
     for (auto buffer : barrier_buffers) {
       buffer_data_to_buffer_.Set(buffer->data, buffer);
@@ -101,9 +102,14 @@ private:
                                 ->as<Map<Var, Array<PrimExpr>>>()
                                 .value();
 
-    // Create init calls for each barrier buffer
-    // Initialize each barrier element with its respective arrive count
-    Array<Stmt> init_mbarrier_calls_;
+    // Large uniform arrays are initialized by one thread per barrier. This
+    // avoids serializing long TMA pipelines on a single elected thread while
+    // retaining the compact elected-thread path for small or heterogeneous
+    // barrier sets.
+    constexpr int64_t kParallelBarrierInitThreshold = 32;
+    const int64_t thread_extent = thread_extent_.as<IntImmNode>()->value;
+    Array<Stmt> serial_init_calls;
+    Array<Stmt> parallel_init_stmts;
     for (auto buffer : barrier_buffers) {
       auto data = buffer->data;
       ICHECK(barrier_init_map.count(data))
@@ -116,30 +122,56 @@ private:
           << ") must match the barrier buffer size (" << buffer->shape[0]
           << ") for buffer " << buffer->name;
 
+      const int64_t barrier_count = buffer->shape[0].as<IntImmNode>()->value;
+      bool uniform_arrive_count = !arrive_counts.empty();
+      for (size_t i = 1; i < arrive_counts.size(); ++i) {
+        uniform_arrive_count =
+            uniform_arrive_count &&
+            StructuralEqual()(arrive_counts[0], arrive_counts[i]);
+      }
+      if (uniform_arrive_count &&
+          barrier_count >= kParallelBarrierInitThreshold &&
+          barrier_count <= thread_extent) {
+        auto call =
+            Call(DataType::Handle(), builtin::ptx_init_barrier_thread_count(),
+                 {BufferLoad(buffer, {thread_var_->var}), arrive_counts[0]});
+        parallel_init_stmts.push_back(
+            IfThenElse(LT(thread_var_->var,
+                          IntImm(thread_var_->var.dtype(), barrier_count)),
+                       Evaluate(call), Stmt()));
+        continue;
+      }
+
       for (size_t i = 0; i < arrive_counts.size(); i++) {
         auto call =
             Call(DataType::Handle(), builtin::ptx_init_barrier_thread_count(),
                  {BufferLoad(buffer,
                              {IntImm(DataType::Int(32), static_cast<int>(i))}),
                   arrive_counts[i]});
-        init_mbarrier_calls_.push_back(Evaluate(call));
+        serial_init_calls.push_back(Evaluate(call));
       }
     }
-    if (init_mbarrier_calls_.empty())
+    if (serial_init_calls.empty() && parallel_init_stmts.empty())
       return block;
 
     Array<Stmt> new_body;
-    PrimExpr condition;
-    if (!disable_shuffle_elect_) {
-      condition = Call(DataType::Bool(), tl_shuffle_elect(), {0});
-    } else {
-      condition = EQ(thread_var_->var, 0);
+    for (const auto &parallel_init : parallel_init_stmts) {
+      new_body.push_back(parallel_init);
     }
-    new_body.push_back(IfThenElse(condition,
-                                  init_mbarrier_calls_.size() == 1
-                                      ? init_mbarrier_calls_.back()
-                                      : SeqStmt(init_mbarrier_calls_),
-                                  Stmt()));
+    if (!serial_init_calls.empty()) {
+      PrimExpr condition;
+      if (!disable_shuffle_elect_) {
+        condition =
+            Call(DataType::Bool(), tl_shuffle_elect(), {thread_extent_});
+      } else {
+        condition = EQ(thread_var_->var, 0);
+      }
+      new_body.push_back(IfThenElse(condition,
+                                    serial_init_calls.size() == 1
+                                        ? serial_init_calls.back()
+                                        : SeqStmt(serial_init_calls),
+                                    Stmt()));
+    }
 
     new_body.push_back(
         Evaluate(Call(DataType::Handle(), ptx_fence_barrier_init(), {})));
@@ -179,6 +211,7 @@ private:
       if (iv->thread_tag == "threadIdx.x") {
         ICHECK(iv->dom->extent.as<IntImmNode>());
         thread_var_ = iv;
+        thread_extent_ = op->value;
       }
     }
     return StmtExprMutator::VisitStmt_(op);
@@ -187,6 +220,7 @@ private:
   // This is a workaround for cpu backend,
   // we need to define a thread_var for the serial loop.
   IterVar thread_var_;
+  PrimExpr thread_extent_;
   Map<Var, Buffer> buffer_data_to_buffer_;
   Map<Buffer, Buffer> buffer_remap_;
   // Mapping from data Var of a Buffer to Buffer, for lookup

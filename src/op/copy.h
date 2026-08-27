@@ -16,6 +16,130 @@ namespace tvm {
 namespace tl {
 using namespace tir;
 
+constexpr int kTransferContractSchemaVersion = 1;
+constexpr int kTransferLoweringPlanSchemaVersion = 1;
+
+constexpr const char *kTransferImplCommonSIMT = "common.simt";
+constexpr const char *kTransferImplCudaTMAFull = "cuda.tma.load.full";
+constexpr const char *kTransferImplCudaTMATail = "cuda.tma.load.tail_oob";
+constexpr const char *kTransferImplCudaCPAsync = "cuda.cp_async";
+// Set only by a common pipeline/warp-specialization pass after it has consumed
+// the transfer's synchronization ownership.  A managed transfer may use an
+// asynchronous instruction; a synchronous fallback must lower to SIMT.
+constexpr const char *kTransferPipelineSyncConsumed =
+    "tl.transfer_pipeline_sync_consumed";
+constexpr int kTransferPipelineSyncManaged = 1;
+constexpr int kTransferPipelineSyncFallback = 2;
+
+enum class TransferSyncOwner : uint8_t {
+  kTransfer = 0,
+  kPipeline = 1,
+  kCaller = 2,
+};
+
+inline const char *TransferSyncOwnerToString(TransferSyncOwner owner) {
+  switch (owner) {
+  case TransferSyncOwner::kTransfer:
+    return "transfer";
+  case TransferSyncOwner::kPipeline:
+    return "pipeline";
+  case TransferSyncOwner::kCaller:
+    return "caller";
+  default:
+    return "unknown";
+  }
+}
+
+/*! \brief Target-independent semantic contract for a bounded transfer. */
+class TransferContractNode : public Object {
+public:
+  int schema_version{kTransferContractSchemaVersion};
+  BufferRegion src_valid_region;
+  PrimExpr oob_fill;
+  bool allow_async{true};
+  int sync_owner{static_cast<int>(TransferSyncOwner::kTransfer)};
+
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
+      kTVMFFISEqHashKindTreeNode;
+
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.TransferContract", TransferContractNode,
+                                    Object);
+
+  static void RegisterReflection() {
+    namespace refl = tvm::ffi::reflection;
+    refl::ObjectDef<TransferContractNode>()
+        .def_ro("schema_version", &TransferContractNode::schema_version)
+        .def_ro("src_valid_region", &TransferContractNode::src_valid_region)
+        .def_ro("oob_fill", &TransferContractNode::oob_fill)
+        .def_ro("allow_async", &TransferContractNode::allow_async)
+        .def_ro("sync_owner", &TransferContractNode::sync_owner);
+  }
+
+  TransferSyncOwner GetSyncOwner() const {
+    return static_cast<TransferSyncOwner>(sync_owner);
+  }
+};
+
+class TransferContract : public ObjectRef {
+public:
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(TransferContract, ObjectRef,
+                                             TransferContractNode);
+
+  TVM_DLL explicit TransferContract(Array<PrimExpr> args);
+  static const Op &Get();
+};
+
+/*! \brief Structured, target-resolved implementation of a transfer contract. */
+class TransferLoweringPlanNode : public Object {
+public:
+  int schema_version{kTransferLoweringPlanSchemaVersion};
+  String implementation_id;
+  bool supported{true};
+  bool asynchronous{false};
+  bool uses_tma_descriptor{false};
+  bool requires_post_fill{false};
+  String selection_reason;
+  Array<String> rejected_candidates;
+
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
+      kTVMFFISEqHashKindTreeNode;
+
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.TransferLoweringPlan",
+                                    TransferLoweringPlanNode, Object);
+
+  static void RegisterReflection() {
+    namespace refl = tvm::ffi::reflection;
+    refl::ObjectDef<TransferLoweringPlanNode>()
+        .def_ro("schema_version", &TransferLoweringPlanNode::schema_version)
+        .def_ro("implementation_id",
+                &TransferLoweringPlanNode::implementation_id)
+        .def_ro("supported", &TransferLoweringPlanNode::supported)
+        .def_ro("asynchronous", &TransferLoweringPlanNode::asynchronous)
+        .def_ro("uses_tma_descriptor",
+                &TransferLoweringPlanNode::uses_tma_descriptor)
+        .def_ro("requires_post_fill",
+                &TransferLoweringPlanNode::requires_post_fill)
+        .def_ro("selection_reason", &TransferLoweringPlanNode::selection_reason)
+        .def_ro("rejected_candidates",
+                &TransferLoweringPlanNode::rejected_candidates);
+  }
+};
+
+class TransferLoweringPlan : public ObjectRef {
+public:
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(TransferLoweringPlan, ObjectRef,
+                                             TransferLoweringPlanNode);
+};
+
+TVM_DLL TransferLoweringPlan MakeTransferLoweringPlan(
+    String implementation_id, bool supported, bool asynchronous,
+    bool uses_tma_descriptor, bool requires_post_fill, String selection_reason,
+    Array<String> rejected_candidates = {});
+
+/*! \brief Whether annotations contain deprecated transfer semantics. */
+TVM_DLL bool
+HasLegacyTransferSemanticAnnotation(const Map<String, ObjectRef> &annotations);
+
 /*!
  * \brief Get TVM Op handle for Conv2DIm2Col.
  */
@@ -29,10 +153,14 @@ class CopyNode : public TileOperatorNode {
 public:
   Buffer src, dst;                   // Source and destination buffers
   Array<Range> src_range, dst_range; // Ranges for each dimension in src and dst
-  Optional<PrimExpr> dst_block;      // Destination block index for cluster copy
+  // Optional target-independent bounds, fill, and synchronization semantics.
+  Optional<TransferContract> transfer_contract;
+  Optional<PrimExpr> src_block; // Source block index for cluster pull
+  Optional<PrimExpr> dst_block; // Destination block index for cluster copy
   Map<String, ObjectRef> annotations; // Backend/pass-specific annotations.
   // Common SIMT annotation keys:
   //   - "coalesced_width": IntImm, width for coalesced memory access.
+  //   - "src_block": PrimExpr, source CTA rank for destination-driven DSM.
   //   - "dst_block": PrimExpr, destination CTA rank for cluster copy.
   //   - attr::kParallelLoopLayout ("parallel_loop_layout"): Fragment, loop
   //     layout hint applied to the outermost generated parallel loop of this
@@ -49,6 +177,8 @@ public:
         .def_ro("dst", &CopyNode::dst)
         .def_ro("src_range", &CopyNode::src_range)
         .def_ro("dst_range", &CopyNode::dst_range)
+        .def_ro("transfer_contract", &CopyNode::transfer_contract)
+        .def_ro("src_block", &CopyNode::src_block)
         .def_ro("dst_block", &CopyNode::dst_block)
         .def_ro("annotations", &CopyNode::annotations);
   }
@@ -78,6 +208,9 @@ public:
    */
   For MakeSIMTLoop(arith::Analyzer *analyzer) const;
 
+  /*! \brief Generate stores that repair contract-invalid destination lanes. */
+  Optional<For> MakeSIMTPostFillLoop(arith::Analyzer *analyzer) const;
+
   /*!
    * \brief Create iterator variables for multi-dimensional copy loops.
    */
@@ -99,6 +232,12 @@ public:
    */
   PrimExpr MakePredicate(arith::Analyzer *analyzer, const Array<IterVar> &ivs,
                          Array<PrimExpr> extents, int src_dst) const;
+
+  /*! \brief Construct a predicate against an absolute rectangular region. */
+  PrimExpr MakeRegionPredicate(arith::Analyzer *analyzer,
+                               const Array<IterVar> &ivs,
+                               const Array<Range> &valid_region,
+                               int src_dst) const;
 
 protected:
   /**
@@ -137,6 +276,32 @@ struct CopyImpl {
 };
 
 void RegisterCopyImpl(CopyImpl impl);
+
+struct TransferLoweringContext {
+  Target target;
+  const LayoutMap *layout_map = nullptr;
+  arith::Analyzer *analyzer = nullptr;
+  bool buffer_oob = false;
+  bool emit_diagnostics = false;
+  bool pipeline_owns_synchronization = false;
+  bool force_synchronous = false;
+};
+
+using TransferLoweringResolver = TransferLoweringPlan (*)(
+    const CopyNode &op, const TransferLoweringContext &context);
+
+struct TransferLoweringImpl {
+  const char *name;
+  CopyTargetPredicate match_target;
+  int priority;
+  TransferLoweringResolver resolve;
+};
+
+TVM_DLL void RegisterTransferLoweringImpl(TransferLoweringImpl impl);
+TVM_DLL TransferLoweringPlan ResolveTransferLowering(
+    const CopyNode &op, const TransferLoweringContext &context);
+TVM_DLL bool TransferRequiresPostFill(const CopyNode &op,
+                                      arith::Analyzer *analyzer);
 
 Stmt LowerNormalCopy(const CopyNode &op, const LowerArgs &T,
                      arith::Analyzer *analyzer);

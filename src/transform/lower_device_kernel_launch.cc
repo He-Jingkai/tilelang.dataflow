@@ -29,6 +29,7 @@
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
+#include "./common/thread_sync_types.h"
 #include "runtime/thread_storage_scope.h"
 #include "tir/transforms/ir_utils.h"
 
@@ -288,6 +289,12 @@ public:
     const auto &info = device_info_map_.at(gvar.get());
     const auto &thread_extent = info.thread_extent;
     func = WithAttr(std::move(func), "thread_extent", thread_extent);
+    func = WithAttrs(
+        std::move(func),
+        {{"tl.cuda_named_barrier_count", Integer(tl::kCudaNamedBarrierCount)},
+         {"tl.cuda_reserved_named_barrier_count",
+          Integer(static_cast<uint8_t>(
+              tl::ReservedNamedBarriers::kFirstUsedBarrier))}});
     if (info.dyn_shmem_size.defined()) {
       func = WithAttr(std::move(func), "dyn_shared_memory_buf",
                       info.dyn_shmem_size.value());

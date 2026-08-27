@@ -252,7 +252,15 @@ class TensorCoreIntrinEmitter:
             )
             return lane_id, warp_n, warp_m
 
-    def ldmatrix_a(self, A_local_buf: Buffer, A_shared_buf: Buffer | BufferRegion, ki: PrimExpr, rk: PrimExpr | None = 0):
+    def ldmatrix_a(
+        self,
+        A_local_buf: Buffer,
+        A_shared_buf: Buffer | BufferRegion,
+        ki: PrimExpr,
+        rk: PrimExpr | None = 0,
+        local_offset: PrimExpr | int = 0,
+        logical_rows: PrimExpr | int | None = None,
+    ):
         # Fast path for fp64: no ldmatrix support, do direct per-lane loads
         a_dtype = self.a_dtype
         if DataType(a_dtype).bits == 64:
@@ -287,9 +295,9 @@ class TensorCoreIntrinEmitter:
                     mi = tx // micro_size_k
                     mk = tx % micro_size_k
                     if a_transposed:
-                        A_local_buf[i * local_size_a] = A_buf[tuple(A_other) + (A_base0 + wk + mk, A_base1 + wi + mi)]
+                        A_local_buf[local_offset + i * local_size_a] = A_buf[tuple(A_other) + (A_base0 + wk + mk, A_base1 + wi + mi)]
                     else:
-                        A_local_buf[i * local_size_a] = A_buf[tuple(A_other) + (A_base0 + wi + mi, A_base1 + wk + mk)]
+                        A_local_buf[local_offset + i * local_size_a] = A_buf[tuple(A_other) + (A_base0 + wi + mi, A_base1 + wk + mk)]
 
             return _warp_ld_a_fp64(A_local_buf, A_region, ki, thread_binding, rk)
 
@@ -303,18 +311,14 @@ class TensorCoreIntrinEmitter:
         # ldmatrix cannot be used for int8 + trans case.
         ldmatrix_available = not (DataType(a_dtype).bits != 16 and a_transposed)
 
-        def mma_load_layout(i, j):
-            return i, j
-
-        if not ldmatrix_available:
-            if DataType(a_dtype).bits == 8:
-                mma_load_layout = mma_load_a_32x16_to_shared_16x32_layout
-            elif DataType(a_dtype).bits == 16:
-                mma_load_layout = mma_load_a_32x8_to_shared_16x16_layout
-            elif DataType(a_dtype).bits == 32:
-                mma_load_layout = mma_load_a_32x4_to_shared_16x8_layout
-            else:
-                raise ValueError(f"Unsupported dtype: {a_dtype}")
+        if DataType(a_dtype).bits == 8:
+            mma_load_layout = mma_load_a_32x16_to_shared_16x32_layout
+        elif DataType(a_dtype).bits == 16:
+            mma_load_layout = mma_load_a_32x8_to_shared_16x16_layout
+        elif DataType(a_dtype).bits == 32:
+            mma_load_layout = mma_load_a_32x4_to_shared_16x8_layout
+        else:
+            raise ValueError(f"Unsupported dtype: {a_dtype}")
 
         thread_binding = self.get_thread_binding()
 
@@ -341,7 +345,8 @@ class TensorCoreIntrinEmitter:
             for i in T.serial(warp_rows):
                 wi, wk = warp_m * warp_row_tiles + i * micro_size_x, rk * chunk + ki * micro_size_k
 
-                if ldmatrix_available:
+                full_logical_tile = logical_rows is None or wi + micro_size_x <= logical_rows
+                if ldmatrix_available and full_logical_tile:
                     row_off, col_off = get_ldmatrix_offset("A", tx, 0, stride, a_dtype, a_transposed)
                     src_indices = (
                         tuple(A_other) + (A_base0 + wk + row_off, A_base1 + wi + col_off)
@@ -352,15 +357,29 @@ class TensorCoreIntrinEmitter:
                         T.bool(trans),
                         4,
                         T.access_ptr(A_buf[src_indices], "r", extent=8),
-                        T.access_ptr(A_local_buf[i * local_size_a], "w", extent=8),
+                        T.access_ptr(
+                            A_local_buf[local_offset + i * local_size_a],
+                            "w",
+                            extent=8,
+                        ),
                     )
                 else:
                     for j in T.serial(local_size_a):
                         mi, mk = mma_load_layout(tx, j)
                         if a_transposed:
-                            A_local_buf[i * local_size_a + j] = A_buf[tuple(A_other) + (A_base0 + wk + mk, A_base1 + wi + mi)]
+                            if logical_rows is None or wi + mi < logical_rows:
+                                A_local_buf[local_offset + i * local_size_a + j] = A_buf[
+                                    tuple(A_other) + (A_base0 + wk + mk, A_base1 + wi + mi)
+                                ]
+                            else:
+                                A_local_buf[local_offset + i * local_size_a + j] = T.cast(0, a_dtype)
                         else:
-                            A_local_buf[i * local_size_a + j] = A_buf[tuple(A_other) + (A_base0 + wi + mi, A_base1 + wk + mk)]
+                            if logical_rows is None or wi + mi < logical_rows:
+                                A_local_buf[local_offset + i * local_size_a + j] = A_buf[
+                                    tuple(A_other) + (A_base0 + wi + mi, A_base1 + wk + mk)
+                                ]
+                            else:
+                                A_local_buf[local_offset + i * local_size_a + j] = T.cast(0, a_dtype)
 
         return _warp_ldmatrix_a(A_local_buf, A_region, ki, thread_binding, rk)
 

@@ -103,6 +103,24 @@ def test_multiple_barriers():
     assert len(syncs) >= 1
 
 
+def test_large_uniform_barrier_array_parallelizes_initialization():
+    @T.prim_func
+    def func():
+        with T.Kernel(1, threads=128):
+            mbars = T.alloc_barrier([1] * 64)  # noqa: F841
+
+    mod = _apply(func)
+    body = mod["main"].body
+    init_calls = _collect_init_barrier_calls(body)
+
+    assert len(init_calls) == 1
+    assert init_calls[0].args[1].value == 1
+    assert isinstance(init_calls[0].args[0], tir.BufferLoad)
+    assert not isinstance(init_calls[0].args[0].indices[0], tir.IntImm)
+    assert len(_collect_shuffle_elect(body)) == 0
+    assert len(_collect_fence_barrier_init(body)) == 1
+
+
 def test_no_barrier_is_noop():
     """Pass should be a no-op when no barrier buffers are present."""
 

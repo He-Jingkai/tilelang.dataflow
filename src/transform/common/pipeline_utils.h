@@ -42,6 +42,51 @@ static constexpr const char *kPipelineAsyncProducers =
 /*! Per-statement async producer group id (-1 = not an async producer). */
 static constexpr const char *kPipelineAsyncProducerGroups =
     "software_pipeline_async_producer_groups";
+/*! Versioned structured decisions attached to the containing PrimFunc. */
+static constexpr const char *kPipelineDecisionSchemaVersion =
+    "tl.pipeline_decision_schema_version";
+static constexpr const char *kPipelineLoweringDecisions =
+    "tl.pipeline_lowering_decisions";
+static constexpr int kPipelineDecisionCurrentSchemaVersion = 1;
+/*! Typed dataflow mode selected for one logical pipeline loop. */
+static constexpr const char *kPipelineDataflowMode =
+    "tl.pipeline_dataflow_mode";
+static constexpr const char *kPipelineDataflowModeSynchronous = "synchronous";
+/*! Optional reason supplied by an earlier common pipeline candidate. */
+static constexpr const char *kPipelineDataflowFallbackReason =
+    "tl.pipeline_dataflow_fallback_reason";
+/*! Logical producer subgroup selected for one typed transfer. */
+static constexpr const char *kPipelineProducerPartition =
+    "tl.pipeline_producer_partition";
+/*! Physical producer thread budget selected by the typed pipeline plan. */
+static constexpr const char *kPipelineProducerThreads =
+    "tl.pipeline_producer_threads";
+/*! Typed physical version count selected for a logical pipeline buffer. */
+static constexpr const char *kPipelineBufferVersions =
+    "tl.pipeline_buffer_versions";
+/*! Typed physical materialization mode for a logical pipeline buffer. */
+static constexpr const char *kPipelineMaterialization =
+    "tl.pipeline_materialization";
+static constexpr const char *kPipelineMaterializationResident = "resident";
+/*! Compiler-owned rank-balanced streamed cluster-push contract. */
+static constexpr const char *kResharedTransportFamily =
+    "tl.reshared_transport_family";
+static constexpr const char *kResharedTransportStreamed = "streamed";
+static constexpr const char *kResharedCreditTargetRank =
+    "tl.reshared_credit_target_rank";
+static constexpr const char *kResharedReceiveStages =
+    "tl.reshared_receive_stages";
+static constexpr const char *kResharedPayloadPartitionBytes =
+    "tl.reshared_payload_partition_bytes";
+
+inline bool PipelineDataflowForcesSynchronous(const For &loop) {
+  if (auto mode = loop->annotations.Get(kPipelineDataflowMode)) {
+    if (const auto *value = mode.value().as<StringImmNode>()) {
+      return value->value == kPipelineDataflowModeSynchronous;
+    }
+  }
+  return false;
+}
 
 // ---------------------------------------------------------------------------
 // GetPipelineNumStages

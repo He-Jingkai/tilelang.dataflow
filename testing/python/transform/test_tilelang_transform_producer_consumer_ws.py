@@ -8,6 +8,58 @@ from tilelang.layout import make_swizzled_layout
 from tilelang.utils.target import determine_target
 
 
+@tilelang.testing.requires_cuda_compute_version(9, 0)
+def test_manual_ws_wgmma_uses_warpgroup_thread_bounds_for_layout_inference():
+    """A WGMMA inside T.ws(0) should infer layout for one 128-thread warpgroup."""
+
+    @T.prim_func
+    def main(
+        A: T.Buffer((64, 512), "float16"),
+        B: T.Buffer((32, 512), "float16"),
+        V: T.Buffer((32, 256), "float16"),
+        C: T.Buffer((64, 256), "float16"),
+    ):
+        with T.Kernel(1, threads=384):
+            A_shared = T.alloc_shared((64, 512), "float16")
+            B_shared = T.alloc_shared((32, 512), "float16")
+            V_shared = T.alloc_shared((32, 256), "float16")
+            S_local = T.alloc_fragment((64, 32), "float32")
+            P_local = T.alloc_fragment((64, 32), "float16")
+            C_local = T.alloc_fragment((64, 256), "float32")
+
+            with T.ws(0, 1), T.ws(0):
+                T.copy(A, A_shared)
+                T.copy(B, B_shared)
+                T.copy(V, V_shared)
+                T.clear(S_local)
+                T.gemm(
+                    A_shared,
+                    B_shared,
+                    S_local,
+                    transpose_B=True,
+                    policy=T.GemmWarpPolicy.FullCol,
+                )
+                T.wait_wgmma(0)
+                for i, j in T.Parallel(64, 32):
+                    P_local[i, j] = T.cast(S_local[i, j], "float16")
+                T.clear(C_local)
+                T.wgmma_gemm_local_p(
+                    P_local,
+                    V_shared,
+                    C_local,
+                    policy=T.GemmWarpPolicy.FullCol,
+                )
+                T.wait_wgmma(0)
+                T.copy(C_local, C)
+
+    kernel = tilelang.compile(main, out_idx=[3], target="cuda -arch=sm_90a")
+    source = kernel.get_kernel_source()
+
+    assert "__launch_bounds__(384, 1)" in source
+    assert "tl::wgmma" in source
+    assert "tl::tl_shuffle_elect<512>()" not in source
+
+
 def matmul_pipelined(M, N, K, block_M, block_K, block_N, num_stages, dtype="float16", threads=128):
     """A simple pipelined GEMM using T.copy + T.gemm tile ops."""
 

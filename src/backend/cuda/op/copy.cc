@@ -11,6 +11,7 @@
 #include "op/utils.h"
 #include "target/utils.h"
 #include "transform/common/loop_fusion_utils.h"
+#include "transform/common/pipeline_utils.h"
 #include "transform/loop_partition.h"
 #include "transform/loop_vectorize.h"
 #include "transform/ptx_async_copy_injector.h"
@@ -33,8 +34,91 @@ using namespace tir;
 
 namespace {
 
+bool NeedsStreamedPushProxyFence(const CopyNode &op) {
+  auto family = op.annotations.Get(kResharedTransportFamily);
+  const auto *value =
+      family.has_value() ? family.value().as<StringImmNode>() : nullptr;
+  return value != nullptr && value->value == kResharedTransportStreamed &&
+         op.annotations.count(kResharedCreditTargetRank) &&
+         op.annotations.count(kResharedReceiveStages);
+}
+
 PrimExpr MakeTmaLeaderCondition(PrimExpr thread_extent) {
   return Call(DataType::Bool(), tl_shuffle_elect(), {std::move(thread_extent)});
+}
+
+bool ContractTMARequiresPostFill(const CopyNode &op, const LowerArgs &T,
+                                 arith::Analyzer *analyzer) {
+  if (!op.transfer_contract.defined()) {
+    return false;
+  }
+  TransferLoweringContext context;
+  context.target = T.target;
+  context.layout_map = &T.layout_map;
+  context.analyzer = analyzer;
+  if (auto consumed = op.annotations.Get(kTransferPipelineSyncConsumed)) {
+    if (const auto *value = consumed.value().as<IntImmNode>()) {
+      context.pipeline_owns_synchronization =
+          value->value == kTransferPipelineSyncManaged;
+      context.force_synchronous = value->value == kTransferPipelineSyncFallback;
+    }
+  }
+  TransferLoweringPlan plan = ResolveTransferLowering(op, context);
+  ICHECK(plan->supported && plan->uses_tma_descriptor)
+      << "TMA lowering and transfer resolution disagree: "
+      << plan->selection_reason;
+  return plan->requires_post_fill;
+}
+
+Optional<Stmt> LowerTransferPostFill(const CopyNode &op, const LowerArgs &T,
+                                     arith::Analyzer *analyzer) {
+  Optional<For> post_fill = op.MakeSIMTPostFillLoop(analyzer);
+  if (!post_fill.defined()) {
+    return std::nullopt;
+  }
+
+  For fused_loop = Downcast<For>(ParallelLoopFuser::Fuse(post_fill.value()));
+  PrimExpr thread_extent = cast(DataType::Int(32), T.thread_bounds->extent);
+  PrimExpr loop_extent = cast(DataType::Int(32), fused_loop->extent);
+  if (!analyzer->CanProve(floormod(loop_extent, thread_extent) == 0)) {
+    PrimExpr rounded_extent = analyzer->Simplify(
+        floordiv(loop_extent + thread_extent - 1, thread_extent) *
+        thread_extent);
+    Stmt guarded_body =
+        IfThenElse(fused_loop->loop_var < loop_extent, fused_loop->body);
+    fused_loop = For(fused_loop->loop_var, fused_loop->min, rounded_extent,
+                     fused_loop->kind, guarded_body, fused_loop->thread_binding,
+                     fused_loop->annotations, std::nullopt, fused_loop->span);
+  }
+  ParallelOp par_op(fused_loop);
+  for (InferLevel level :
+       {InferLevel::kCommon, InferLevel::kStrict, InferLevel::kFree}) {
+    par_op->InferLayout({T.target,
+                         T.thread_bounds,
+                         T.layout_map,
+                         analyzer,
+                         false,
+                         T.buffer_remap,
+                         {}},
+                        level);
+  }
+  auto loop_layout = par_op->GetLoopLayout();
+  return LowerParallelLoop(par_op->GetRoot(), loop_layout, T.thread_var,
+                           analyzer, T.layout_map,
+                           par_op->GetPredicate(T.thread_var));
+}
+
+PrimExpr GetTmaLeaderThreadExtent(const CopyNode &op, PrimExpr default_extent) {
+  auto value = op.annotations.Get("leader_thread_extent");
+  if (!value) {
+    return default_extent;
+  }
+  const auto *extent = value.value().as<IntImmNode>();
+  ICHECK(extent) << "leader_thread_extent must be a compile-time integer";
+  ICHECK(extent->value == 0 || (extent->value >= 32 && extent->value % 32 == 0))
+      << "leader_thread_extent must be 0 or a positive multiple of 32, got "
+      << extent->value;
+  return IntImm(DataType::Int(32), extent->value);
 }
 
 PrimExpr TMABytesFromElements(PrimExpr elements, DataType dtype) {
@@ -339,6 +423,9 @@ private:
   static Stmt LowerCluster(const CopyNode &op, const LowerArgs &T,
                            arith::Analyzer *analyzer);
 
+  static Stmt LowerClusterPull(const CopyNode &op, const LowerArgs &T,
+                               arith::Analyzer *analyzer);
+
   static Stmt LowerCPAsync(const CopyNode &op, const LowerArgs &T,
                            arith::Analyzer *analyzer);
 
@@ -586,6 +673,13 @@ Stmt Copy::Lower(const CopyNode &op, const LowerArgs &T,
                  arith::Analyzer *analyzer) {
   auto copy_inst =
       SelectInst(op, T.target, T.layout_map, analyzer, /*buffer_oob=*/false);
+  if (op.src_block.defined()) {
+    ICHECK(TargetHasBulkCopy(T.target))
+        << "T.copy with compiler-owned src_block requires cluster DSM support "
+           "(CUDA SM90+). Got target="
+        << T.target;
+    return LowerClusterPull(op, T, analyzer);
+  }
   if (op.dst_block.defined()) {
     ICHECK(TargetHasBulkCopy(T.target))
         << "T.copy with dst_block requires cluster-copy support (CUDA SM90+). "
@@ -603,6 +697,13 @@ Stmt Copy::Lower(const CopyNode &op, const LowerArgs &T,
     return bulk_copy;
   } else if (copy_inst == CopyInst::kBulkLoad ||
              copy_inst == CopyInst::kBulkStore) {
+    if (op.transfer_contract.defined() && copy_inst == CopyInst::kBulkLoad &&
+        !T.AllocMBarrier) {
+      DLOG(WARNING)
+          << "Contract TMA load requires compiler-owned mbarrier allocation; "
+             "fallback to synchronous SIMT copy.";
+      return LowerNormal(op, T, analyzer);
+    }
     auto bulk_copy = LowerBulk(op, T, analyzer, copy_inst);
     ICHECK(bulk_copy.defined()) << "Failed to lower bulk load/store";
     return bulk_copy;
@@ -619,6 +720,95 @@ Stmt Copy::Lower(const CopyNode &op, const LowerArgs &T,
   } else {
     LOG(FATAL) << "Unsupported copy inst " << static_cast<int>(copy_inst);
   }
+}
+
+Stmt Copy::LowerClusterPull(const CopyNode &op, const LowerArgs &T,
+                            arith::Analyzer *analyzer) {
+  const Buffer &src = op.src;
+  const Buffer &dst = op.dst;
+  ICHECK(op.src_block.defined());
+  ICHECK(src.scope() == "shared" || src.scope() == "shared.dyn");
+  ICHECK(dst.scope() == "shared" || dst.scope() == "shared.dyn");
+  ICHECK(IsContiguousRegion(src, op.src_range, analyzer) &&
+         IsContiguousRegion(dst, op.dst_range, analyzer))
+      << "destination-driven cluster transport requires contiguous regions";
+
+  PrimExpr src_elements = 1;
+  for (const Range &range : op.src_range) {
+    src_elements *= range->extent;
+  }
+  PrimExpr dst_elements = 1;
+  for (const Range &range : op.dst_range) {
+    dst_elements *= range->extent;
+  }
+  ICHECK(analyzer->CanProveEqual(src_elements, dst_elements))
+      << "destination-driven cluster transport requires equal element counts";
+  const int64_t *static_elements = as_const_int(src_elements);
+  ICHECK(static_elements != nullptr && *static_elements > 0)
+      << "destination-driven cluster transport requires a static payload";
+  int element_bytes = (src->dtype.bits() * src->dtype.lanes() + 7) / 8;
+  ICHECK_GT(element_bytes, 0);
+  int64_t total_bytes = *static_elements * element_bytes;
+
+  auto compute_linear_offset = [](const Buffer &buffer,
+                                  const Array<Range> &ranges) -> PrimExpr {
+    PrimExpr offset = 0;
+    PrimExpr stride = 1;
+    for (int axis = static_cast<int>(ranges.size()) - 1; axis >= 0; --axis) {
+      offset += ranges[axis]->min * stride;
+      if (axis > 0) {
+        stride *= buffer->shape[axis];
+      }
+    }
+    return offset;
+  };
+  PrimExpr src_offset = compute_linear_offset(src, op.src_range);
+  PrimExpr dst_offset = compute_linear_offset(dst, op.dst_range);
+
+  auto raw_partitions =
+      op.annotations.Get("tl.reshared_payload_partition_bytes");
+  ICHECK(raw_partitions.has_value())
+      << "cluster pull lowering requires typed payload partitions";
+  Array<PrimExpr> partitions =
+      Downcast<Array<PrimExpr>>(raw_partitions.value());
+  ICHECK(!partitions.empty())
+      << "typed payload partitions must be a non-empty integer array";
+  auto raw_threads = op.annotations.Get("tl.reshared_transfer_threads");
+  const auto *transfer_threads =
+      raw_threads.has_value() ? raw_threads.value().as<IntImmNode>() : nullptr;
+  ICHECK(transfer_threads != nullptr && transfer_threads->value > 0)
+      << "cluster pull lowering requires a positive transfer thread count";
+
+  Array<Stmt> pulls;
+  int64_t byte_offset = 0;
+  for (const PrimExpr &partition : partitions) {
+    const int64_t *static_partition = as_const_int(partition);
+    ICHECK(static_partition != nullptr && *static_partition > 0)
+        << "typed payload partitions must contain positive integer values";
+    int64_t byte_count = *static_partition;
+    ICHECK_EQ(byte_offset % element_bytes, 0);
+    ICHECK_EQ(byte_count % element_bytes, 0);
+    int64_t element_offset = byte_offset / element_bytes;
+    int64_t element_count = byte_count / element_bytes;
+    PrimExpr element_count_expr = IntImm(DataType::Int(64), element_count);
+    PrimExpr dst_ptr = dst.access_ptr(
+        2, DataType::Handle(), 1,
+        dst_offset + make_const(dst_offset.dtype(), element_offset),
+        element_count_expr);
+    PrimExpr src_ptr = src.access_ptr(
+        1, DataType::Handle(), 1,
+        src_offset + make_const(src_offset.dtype(), element_offset),
+        element_count_expr);
+    pulls.push_back(Evaluate(Call(
+        DataType::Handle(), tl::cluster_pull(),
+        {dst_ptr, src_ptr, op.src_block.value(),
+         IntImm(DataType::UInt(32), byte_count), IntImm(DataType::UInt(32), 0),
+         IntImm(DataType::UInt(32), transfer_threads->value)})));
+    byte_offset += byte_count;
+  }
+  ICHECK_EQ(byte_offset, total_bytes)
+      << "typed payload partitions do not cover the cluster pull region";
+  return pulls.size() == 1 ? pulls[0] : Stmt(SeqStmt(pulls));
 }
 
 Stmt Copy::LowerCPAsync(const CopyNode &op, const LowerArgs &T,
@@ -658,7 +848,9 @@ Stmt Copy::LowerCPAsync(const CopyNode &op, const LowerArgs &T,
   auto inject_result =
       InjectPTXAsyncCopy(lowered_loop, /*enable_auto_async_copy=*/true,
                          /*async_without_async_commit_wait=*/
-                         no_implicit_commit_wait || GetIsAsyncCopy(op));
+                         no_implicit_commit_wait || GetIsAsyncCopy(op),
+                         /*assume_src_in_bounds=*/
+                         GetBoolAnnotation(op, "assume_src_in_bounds"));
   Stmt cp_async_loop = inject_result.stmt;
   if (!inject_result.injected_ptx_async_copy) {
     DLOG(WARNING) << "cp.async rewrite miss for copy src=" << op.src->name
@@ -707,6 +899,7 @@ Stmt Copy::LowerCluster(const CopyNode &op, const LowerArgs &T,
   ICHECK(op.dst_block.defined());
   ICHECK(src.scope() == "shared" || src.scope() == "shared.dyn");
   ICHECK(dst.scope() == "shared" || dst.scope() == "shared.dyn");
+  bool needs_streamed_push_proxy_fence = NeedsStreamedPushProxyFence(op);
 
   if (auto barrier_opt = GetBarrier(op)) {
     bool src_contiguous = IsContiguousRegion(src, src_range, analyzer);
@@ -744,19 +937,63 @@ Stmt Copy::LowerCluster(const CopyNode &op, const LowerArgs &T,
       for (auto r : src_range) {
         total_elements = total_elements * r->extent;
       }
-      PrimExpr size_bytes = cast(
-          DataType::UInt(32), TMABytesFromElements(total_elements, src->dtype));
+      int element_bytes = (src->dtype.bits() * src->dtype.lanes() + 7) / 8;
+      ICHECK_GT(element_bytes, 0);
+      const int64_t *static_total_elements = as_const_int(total_elements);
+      ICHECK(static_total_elements != nullptr && *static_total_elements > 0)
+          << "cluster bulk copy requires a static positive payload";
+      int64_t total_bytes = *static_total_elements * element_bytes;
 
-      PrimExpr dst_ptr =
-          dst.access_ptr(2, DataType::Handle(), 1, dst_offset, total_elements);
-      PrimExpr src_ptr =
-          src.access_ptr(1, DataType::Handle(), 1, src_offset, total_elements);
+      Array<PrimExpr> partition_bytes;
+      if (auto raw =
+              op.annotations.Get("tl.reshared_payload_partition_bytes")) {
+        partition_bytes = Downcast<Array<PrimExpr>>(raw.value());
+      } else {
+        partition_bytes.push_back(IntImm(DataType::Int(64), total_bytes));
+      }
+      ICHECK(!partition_bytes.empty())
+          << "cluster bulk copy requires at least one payload partition";
 
-      Stmt bulk_copy = Evaluate(Call(
-          DataType::Handle(), tma_store_cluster(),
-          {dst_ptr, src_ptr, op.dst_block.value(), size_bytes, barrier_load}));
+      Array<Stmt> bulk_copies;
+      int64_t byte_offset = 0;
+      for (const PrimExpr &partition : partition_bytes) {
+        const int64_t *static_bytes = as_const_int(partition);
+        ICHECK(static_bytes != nullptr && *static_bytes > 0)
+            << "cluster bulk copy partitions must be static and positive";
+        ICHECK_EQ(byte_offset % element_bytes, 0);
+        ICHECK_EQ(*static_bytes % element_bytes, 0);
+        int64_t element_offset = byte_offset / element_bytes;
+        int64_t element_count = *static_bytes / element_bytes;
+        PrimExpr dst_ptr = dst.access_ptr(
+            2, DataType::Handle(), 1,
+            dst_offset + make_const(dst_offset.dtype(), element_offset),
+            IntImm(DataType::Int(64), element_count));
+        PrimExpr src_ptr = src.access_ptr(
+            1, DataType::Handle(), 1,
+            src_offset + make_const(src_offset.dtype(), element_offset),
+            IntImm(DataType::Int(64), element_count));
+        bulk_copies.push_back(Evaluate(
+            Call(DataType::Handle(), tma_store_cluster(),
+                 {dst_ptr, src_ptr, op.dst_block.value(),
+                  IntImm(DataType::UInt(32), *static_bytes), barrier_load})));
+        byte_offset += *static_bytes;
+      }
+      ICHECK_EQ(byte_offset, total_bytes)
+          << "cluster bulk copy partitions do not cover the payload";
+      if (needs_streamed_push_proxy_fence) {
+        // Streamed push writes its source through the generic shared-memory
+        // proxy and consumes it through the async proxy. InjectFenceProxy runs
+        // before tile-op lowering and therefore cannot see these stores.
+        bulk_copies.insert(
+            bulk_copies.begin(),
+            Evaluate(Call(DataType::Handle(), fence_proxy_async(), {})));
+      }
+      Stmt bulk_copy =
+          bulk_copies.size() == 1 ? bulk_copies[0] : Stmt(SeqStmt(bulk_copies));
 
-      return IfThenElse(EQ(T.thread_var, T.thread_bounds->min), bulk_copy);
+      return IfThenElse(MakeTmaLeaderCondition(GetTmaLeaderThreadExtent(
+                            op, T.thread_bounds->extent)),
+                        bulk_copy);
     }
 
     bool same_shape = (src_range.size() == dst_range.size());
@@ -782,10 +1019,17 @@ Stmt Copy::LowerCluster(const CopyNode &op, const LowerArgs &T,
         T.UpdateBarrierArrive(barrier_data_var, n_rows);
       }
 
+      if (needs_streamed_push_proxy_fence) {
+        tma_stmts.insert(
+            tma_stmts.begin(),
+            Evaluate(Call(DataType::Handle(), fence_proxy_async(), {})));
+      }
       Stmt seq = (tma_stmts.size() == 1)
                      ? tma_stmts[0]
                      : static_cast<Stmt>(SeqStmt(tma_stmts));
-      return IfThenElse(EQ(T.thread_var, T.thread_bounds->min), seq);
+      return IfThenElse(MakeTmaLeaderCondition(GetTmaLeaderThreadExtent(
+                            op, T.thread_bounds->extent)),
+                        seq);
     }
 
     LOG(WARNING)
@@ -1304,10 +1548,18 @@ Stmt Copy::LowerBulk(const CopyNode &op, const LowerArgs &T,
   ICHECK(shared_strides.size() == shared_indices.size())
       << "shared_strides.size() != shared_indices.size()"
       << shared_strides.size() << " " << shared_indices.size();
-  PrimExpr shared_offset = 0;
-  for (size_t i = 0; i < shared_indices.size(); i++) {
-    shared_offset += shared_indices[i] * shared_strides[i];
-  }
+  auto linearize = [](const Array<PrimExpr> &shape,
+                      const Array<PrimExpr> &indices) -> PrimExpr {
+    ICHECK_EQ(shape.size(), indices.size());
+    PrimExpr offset = 0;
+    PrimExpr stride = 1;
+    for (int i = static_cast<int>(indices.size()) - 1; i >= 0; --i) {
+      offset = offset + indices[i] * stride;
+      stride = stride * shape[i];
+    }
+    return offset;
+  };
+  PrimExpr shared_offset = linearize(shared_tensor->shape, shared_indices);
   PrimExpr global_offset = 0;
   for (size_t i = 0; i < global_indices.size(); i++) {
     global_offset += global_indices[i] * global_strides[i];
@@ -1358,8 +1610,8 @@ Stmt Copy::LowerBulk(const CopyNode &op, const LowerArgs &T,
     if (is_one(g_range->extent)) {
       continue;
     }
-    while (is_one(shared_range[s_range_idx]->extent) &&
-           s_range_idx < shared_range.size()) {
+    while (s_range_idx < shared_range.size() &&
+           is_one(shared_range[s_range_idx]->extent)) {
       s_range_idx++;
     }
     if (s_range_idx >= shared_range.size()) {
@@ -1384,6 +1636,7 @@ Stmt Copy::LowerBulk(const CopyNode &op, const LowerArgs &T,
   desc.interleave = static_cast<int>(CU_TENSOR_MAP_INTERLEAVE_NONE);
 
   Layout shared_layout;
+  bool has_non_linear_shared_layout = false;
   if (T.layout_map.count(shared_tensor)) {
     shared_layout = T.layout_map.at(shared_tensor);
     ICHECK(T.buffer_remap.count(shared_tensor))
@@ -1396,6 +1649,7 @@ Stmt Copy::LowerBulk(const CopyNode &op, const LowerArgs &T,
   } else if (StructuralEqual()(shared_layout, linear_layout)) {
     desc.swizzle = static_cast<int>(CU_TENSOR_MAP_SWIZZLE_NONE);
   } else {
+    has_non_linear_shared_layout = true;
     if (shared_layout->InputDim() < 2) {
       DLOG(WARNING) << "TMA bulk copy cannot support shared layout with input "
                     << "dimension " << shared_layout->InputDim()
@@ -1428,6 +1682,12 @@ Stmt Copy::LowerBulk(const CopyNode &op, const LowerArgs &T,
                     << ", fallback to normal copy";
       return LowerNormal(op, T, analyzer);
     }
+  }
+  if (has_non_linear_shared_layout) {
+    Array<PrimExpr> physical_indices = shared_layout->Forward(shared_indices);
+    Array<PrimExpr> physical_shape = shared_layout->OutputShape();
+    shared_offset =
+        analyzer->Simplify(linearize(physical_shape, physical_indices));
   }
 
   auto inner_box_dim = as_const_int(desc.smem_box[0]);
@@ -1624,22 +1884,24 @@ Stmt Copy::LowerBulk(const CopyNode &op, const LowerArgs &T,
       total_bytes = TMABytesFromElements(total_elements, shared_tensor->dtype);
     }
 
-    Stmt barrier_before_tma_stmt;
+    Optional<Stmt> barrier_before_tma_stmt = std::nullopt;
     Optional<Stmt> barrier_after_tma_stmt = std::nullopt;
     if (GetIsTmaCopy(op)) {
-      if (is_cluster_barrier) {
-        PrimExpr cluster_total_bytes =
-            total_bytes * IntImm(DataType::Int(32), T.cluster_size);
-        Stmt expect_stmt =
-            Evaluate(Call(DataType::Handle(), mbarrier_expect_tx(),
-                          {mbar_handle, cluster_total_bytes}));
-        PrimExpr rank = Call(DataType::Int(32), block_rank_in_cluster(), {});
-        barrier_before_tma_stmt =
-            IfThenElse(EQ(rank, IntImm(DataType::Int(32), 0)), expect_stmt);
-      } else {
-        barrier_before_tma_stmt =
-            Evaluate(Call(DataType::Handle(), mbarrier_expect_tx(),
-                          {mbar_handle, total_bytes}));
+      if (!GetBoolAnnotation(op, "skip_expect_transaction")) {
+        if (is_cluster_barrier) {
+          PrimExpr cluster_total_bytes =
+              total_bytes * IntImm(DataType::Int(32), T.cluster_size);
+          Stmt expect_stmt =
+              Evaluate(Call(DataType::Handle(), mbarrier_expect_tx(),
+                            {mbar_handle, cluster_total_bytes}));
+          PrimExpr rank = Call(DataType::Int(32), block_rank_in_cluster(), {});
+          barrier_before_tma_stmt =
+              IfThenElse(EQ(rank, IntImm(DataType::Int(32), 0)), expect_stmt);
+        } else {
+          barrier_before_tma_stmt =
+              Evaluate(Call(DataType::Handle(), mbarrier_expect_tx(),
+                            {mbar_handle, total_bytes}));
+        }
       }
       if (auto emit_arrive_val = annotations.Get("emit_arrive")) {
         if (Downcast<IntImm>(emit_arrive_val.value())->value != 0) {
@@ -1656,13 +1918,21 @@ Stmt Copy::LowerBulk(const CopyNode &op, const LowerArgs &T,
           DataType::Handle(), builtin::ptx_arrive_barrier(), {mbar_handle}));
     }
 
-    Array<Stmt> producer_seq{barrier_before_tma_stmt, tma_copy};
+    Array<Stmt> producer_seq;
+    if (barrier_before_tma_stmt.defined()) {
+      producer_seq.push_back(barrier_before_tma_stmt.value());
+    }
+    producer_seq.push_back(tma_copy);
     if (barrier_after_tma_stmt.defined()) {
       producer_seq.push_back(barrier_after_tma_stmt.value());
     }
 
-    Stmt producer = IfThenElse(MakeTmaLeaderCondition(T.thread_bounds->extent),
-                               SeqStmt(producer_seq));
+    Stmt producer_body = producer_seq.size() == 1
+                             ? producer_seq[0]
+                             : static_cast<Stmt>(SeqStmt(producer_seq));
+    Stmt producer = IfThenElse(MakeTmaLeaderCondition(GetTmaLeaderThreadExtent(
+                                   op, T.thread_bounds->extent)),
+                               producer_body);
 
     if (GetIsTmaCopy(op)) {
       return producer;
@@ -1672,11 +1942,22 @@ Stmt Copy::LowerBulk(const CopyNode &op, const LowerArgs &T,
         Evaluate(Call(DataType::Handle(), mbarrier_wait_parity(),
                       {mbar_handle, GetCopyMbarPhaseExpr(annotations, T)}));
 
-    return SeqStmt({producer, wait_stmt});
+    Array<Stmt> consumer_seq{producer, wait_stmt};
+    if (ContractTMARequiresPostFill(op, T, analyzer)) {
+      Optional<Stmt> post_fill = LowerTransferPostFill(op, T, analyzer);
+      ICHECK(post_fill.defined())
+          << "tail TMA transfer plan requires a cooperative post-fill loop";
+      consumer_seq.push_back(post_fill.value());
+      consumer_seq.push_back(
+          Evaluate(Call(DataType::Int(32), builtin::tvm_storage_sync(),
+                        {StringImm("shared")})));
+    }
+    return SeqStmt(consumer_seq);
   }
 
-  tma_copy =
-      IfThenElse(MakeTmaLeaderCondition(T.thread_bounds->extent), tma_copy);
+  tma_copy = IfThenElse(MakeTmaLeaderCondition(GetTmaLeaderThreadExtent(
+                            op, T.thread_bounds->extent)),
+                        tma_copy);
 
   return tma_copy;
 }
@@ -1794,12 +2075,14 @@ Stmt Copy::LowerBulk1D(const CopyNode &op, const LowerArgs &T,
   }
 
   if (is_load && barrier_base_id >= 0) {
-    Stmt barrier_before_tma_stmt;
+    Optional<Stmt> barrier_before_tma_stmt = std::nullopt;
     Optional<Stmt> barrier_after_tma_stmt = std::nullopt;
     if (GetIsTmaCopy(op)) {
-      barrier_before_tma_stmt =
-          Evaluate(Call(DataType::Handle(), mbarrier_expect_tx(),
-                        {mbar_handle, total_bytes}));
+      if (!GetBoolAnnotation(op, "skip_expect_transaction")) {
+        barrier_before_tma_stmt =
+            Evaluate(Call(DataType::Handle(), mbarrier_expect_tx(),
+                          {mbar_handle, total_bytes}));
+      }
     } else {
       barrier_before_tma_stmt =
           Evaluate(Call(DataType::Handle(), mbarrier_expect_tx(),
@@ -1808,13 +2091,21 @@ Stmt Copy::LowerBulk1D(const CopyNode &op, const LowerArgs &T,
           DataType::Handle(), builtin::ptx_arrive_barrier(), {mbar_handle}));
     }
 
-    Array<Stmt> producer_seq{barrier_before_tma_stmt, tma_copy};
+    Array<Stmt> producer_seq;
+    if (barrier_before_tma_stmt.defined()) {
+      producer_seq.push_back(barrier_before_tma_stmt.value());
+    }
+    producer_seq.push_back(tma_copy);
     if (barrier_after_tma_stmt.defined()) {
       producer_seq.push_back(barrier_after_tma_stmt.value());
     }
 
-    Stmt producer = IfThenElse(MakeTmaLeaderCondition(T.thread_bounds->extent),
-                               SeqStmt(producer_seq));
+    Stmt producer_body = producer_seq.size() == 1
+                             ? producer_seq[0]
+                             : static_cast<Stmt>(SeqStmt(producer_seq));
+    Stmt producer = IfThenElse(MakeTmaLeaderCondition(GetTmaLeaderThreadExtent(
+                                   op, T.thread_bounds->extent)),
+                               producer_body);
 
     if (GetIsTmaCopy(op)) {
       return producer;
@@ -1827,8 +2118,9 @@ Stmt Copy::LowerBulk1D(const CopyNode &op, const LowerArgs &T,
     return SeqStmt({producer, wait_stmt});
   }
 
-  tma_copy =
-      IfThenElse(MakeTmaLeaderCondition(T.thread_bounds->extent), tma_copy);
+  tma_copy = IfThenElse(MakeTmaLeaderCondition(GetTmaLeaderThreadExtent(
+                            op, T.thread_bounds->extent)),
+                        tma_copy);
   return tma_copy;
 }
 
@@ -2033,6 +2325,18 @@ bool RegisterCudaCopy() {
 }
 
 const bool cuda_copy_registered = RegisterCudaCopy();
+
+bool RegisterCudaTransferLowering() {
+  RegisterTransferLoweringImpl(TransferLoweringImpl{
+      "cuda.TransferLowering",
+      MatchCudaCopyTarget,
+      100,
+      cuda::ResolveCudaTransferLowering,
+  });
+  return true;
+}
+
+const bool cuda_transfer_lowering_registered = RegisterCudaTransferLowering();
 
 bool RegisterCudaConv2DIm2Col() {
   RegisterConv2DIm2ColImpl(Conv2DIm2ColImpl{

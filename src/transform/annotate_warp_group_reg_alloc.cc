@@ -24,6 +24,15 @@ using namespace tir;
 
 namespace {
 
+constexpr int kWarpGroupThreadCount = 128;
+constexpr int kMinimumWarpGroupRegisters = 24;
+constexpr int kSingleConsumerProducerRegisters = 40;
+constexpr int kSingleConsumerRegisters = 232;
+constexpr int kDefaultProducerRegisters = kMinimumWarpGroupRegisters;
+constexpr int kDefaultConsumerRegisters = 240;
+constexpr const char *kCrossHandlerHandoffEnabled =
+    "tl.cross_handler_handoff_enabled";
+
 template <typename F>
 Stmt RewriteWarpSpecializationBody(const Stmt &stmt, F &&rewrite_if,
                                    bool *rewrote) {
@@ -192,6 +201,8 @@ public:
     SetMaxNRegCollector::Result result = SetMaxNRegCollector::Collect(f);
     T.nreg_ = result.nreg;
     T.preserve_explicit_set_max_nreg_ = result.preserve_explicit_set_max_nreg;
+    T.normalize_cross_handler_reg_state_ =
+        f->HasNonzeroAttr(kCrossHandlerHandoffEnabled);
     if (T.nreg_.empty()) {
       return f;
     }
@@ -241,8 +252,11 @@ private:
         auto dec_reg = nreg_[0].as<IntImmNode>()->value;
         auto inc_reg = nreg_[1].as<IntImmNode>()->value;
 
-        auto inc_reg_stmt = Evaluate(0);
-        auto dec_reg_stmt = Evaluate(0);
+        auto consumer_reg_stmt = Evaluate(0);
+        auto producer_reg_stmt = Evaluate(0);
+        bool inject_reg_reallocation = false;
+        int final_dec_reg = -1;
+        int final_inc_reg = -1;
 
         // Default hints stay conservative: skip auto-injection when producer
         // contains SIMT copy-like statements. Explicit user hints should still
@@ -252,33 +266,85 @@ private:
 
         if (dec_reg != -1 && inc_reg != -1 &&
             (has_explicit_hints || !has_simt_copy)) {
-          int final_dec_reg = has_explicit_hints ? dec_reg : 24;
-          int final_inc_reg = has_explicit_hints ? inc_reg : 240;
-          dec_reg_stmt =
+          int default_dec_reg = kDefaultProducerRegisters;
+          int default_inc_reg = kDefaultConsumerRegisters;
+          const auto *producer_partition = if_then_else->condition.as<GENode>();
+          const auto *canonical_partition =
+              if_then_else->condition.as<LENode>();
+          const int64_t *consumer_thread_extent = nullptr;
+          if (producer_partition != nullptr) {
+            consumer_thread_extent = as_const_int(producer_partition->b);
+          } else if (canonical_partition != nullptr) {
+            consumer_thread_extent = as_const_int(canonical_partition->a);
+          }
+          if (consumer_thread_extent != nullptr &&
+              *consumer_thread_extent == kWarpGroupThreadCount) {
+            default_dec_reg = kSingleConsumerProducerRegisters;
+            default_inc_reg = kSingleConsumerRegisters;
+          }
+          final_dec_reg = has_explicit_hints ? dec_reg : default_dec_reg;
+          final_inc_reg = has_explicit_hints ? inc_reg : default_inc_reg;
+          producer_reg_stmt =
               Evaluate(Call(DataType::Handle(), set_max_nreg(),
                             {IntImm(DataType::Int(32), final_dec_reg),
                              IntImm(DataType::Int(32), 0)}));
-          inc_reg_stmt =
+          consumer_reg_stmt =
               Evaluate(Call(DataType::Handle(), set_max_nreg(),
                             {IntImm(DataType::Int(32), final_inc_reg),
                              IntImm(DataType::Int(32), 1)}));
+          inject_reg_reallocation = true;
         }
 
-        Array<Stmt> producer_stmts;
-        producer_stmts.push_back(dec_reg_stmt);
-        producer_stmts.push_back(producer_body);
-        auto new_producer_body = SeqStmt(producer_stmts);
+        auto normalize_reg_state = Evaluate(
+            Call(DataType::Handle(), set_max_nreg(),
+                 {IntImm(DataType::Int(32), kMinimumWarpGroupRegisters),
+                  IntImm(DataType::Int(32), 0)}));
+        bool normalize_roles =
+            inject_reg_reallocation && normalize_cross_handler_reg_state_;
+        if (normalize_roles) {
+          ICHECK_GE(final_dec_reg, kMinimumWarpGroupRegisters)
+              << "cross-handler producer register allocation is below the "
+                 "PTX minimum";
+        }
 
         if (consumer_body.defined()) {
+          Array<Stmt> producer_stmts{producer_reg_stmt, producer_body};
+          // setmaxnreg.dec is not idempotent. A multi-consumer pipeline may
+          // already assign the producer the PTX minimum, in which case a
+          // second dec-to-24 raises CUDA_ERROR_ILLEGAL_INSTRUCTION.
+          if (normalize_roles && final_dec_reg != kMinimumWarpGroupRegisters) {
+            producer_stmts.push_back(normalize_reg_state);
+          }
+          auto new_producer_body = SeqStmt(producer_stmts);
           Array<Stmt> consumer_stmts;
-          consumer_stmts.push_back(inc_reg_stmt);
+          consumer_stmts.push_back(consumer_reg_stmt);
           consumer_stmts.push_back(consumer_body.value());
+          if (normalize_roles) {
+            consumer_stmts.push_back(normalize_reg_state);
+          }
           auto new_consumer_body = SeqStmt(consumer_stmts);
-          return IfThenElse(if_then_else->condition, new_producer_body,
-                            new_consumer_body);
+          // Keep the two role lifetimes independent through CUDA codegen.
+          // A single if/else can make ptxas couple producer and consumer
+          // locals even though the warp-group predicates are complementary.
+          return SeqStmt(
+              {IfThenElse(if_then_else->condition, new_producer_body),
+               IfThenElse(Not(if_then_else->condition), new_consumer_body)});
         }
 
-        return IfThenElse(if_then_else->condition, new_producer_body);
+        Array<Stmt> producer_stmts{producer_reg_stmt, producer_body};
+        if (normalize_roles && final_dec_reg != kMinimumWarpGroupRegisters) {
+          producer_stmts.push_back(normalize_reg_state);
+        }
+        Stmt producer_role =
+            IfThenElse(if_then_else->condition, SeqStmt(producer_stmts));
+        if (normalize_roles) {
+          // Warp groups outside a producer-only role retain the canonical
+          // entry allocation and must also join the wrapper restoration.
+          Stmt inactive_role =
+              IfThenElse(Not(if_then_else->condition), normalize_reg_state);
+          return SeqStmt({producer_role, inactive_role});
+        }
+        return producer_role;
       };
 
       Stmt new_body =
@@ -294,6 +360,7 @@ private:
 
   Array<IntImm> nreg_;
   bool preserve_explicit_set_max_nreg_{false};
+  bool normalize_cross_handler_reg_state_{false};
   IterVar thread_iv_;
   Optional<PrimExpr> updated_thread_extent_;
   bool need_update_thread_extent_ = false;

@@ -624,6 +624,11 @@ def get_warp_idx(
     return tir.call_intrin("int32", tir.op.Op.get("tl.get_warp_idx"), warp_size_expr)
 
 
+def smid() -> PrimExpr:
+    """Return the physical SM id for the current CUDA CTA/thread."""
+    return tir.call_intrin("int32", tir.op.Op.get("tl.smid"))
+
+
 def get_warp_group_idx(
     warp_size: int | PrimExpr | None = None,
     warps_per_group: int | PrimExpr | None = None,

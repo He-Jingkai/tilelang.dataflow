@@ -54,6 +54,11 @@ def InstructionAnnotation():
     return _ffi_api.InstructionAnnotation()  # type: ignore
 
 
+def MaterializeLogicalGemm():
+    """Resolve logical GEMM plans and materialize physical buffers pre-layout."""
+    return _ffi_api.MaterializeLogicalGemm()  # type: ignore
+
+
 def LayoutInference():
     """LayoutInference
 

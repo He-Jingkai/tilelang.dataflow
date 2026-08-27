@@ -6,6 +6,7 @@
 
 #include "fill.h"
 
+#include "builtin.h"
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/op.h>
 #include <tvm/tir/op_attr_types.h>
@@ -101,6 +102,12 @@ Fill::Fill(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
   } else {
     node->value = args[1];
   }
+  if (auto value = annotations.Get(attr::kPredicatedFillPartition)) {
+    const auto *enabled = value.value().as<IntImmNode>();
+    ICHECK(enabled != nullptr)
+        << attr::kPredicatedFillPartition << " must be an integer bool";
+    node->predicated_partition = enabled->value != 0;
+  }
 
   ICHECK(node->region.size() == node->dst->shape.size())
       << "region size = " << node->region.size()
@@ -150,8 +157,61 @@ TileOperator FillNode::Clone() const {
  *
  * @return For Outermost parallel `For` loop of the generated nested SIMT loop.
  */
-For FillNode::MakeSIMTLoop(arith::Analyzer *analyzer) const {
+For FillNode::MakeSIMTLoop(arith::Analyzer *analyzer,
+                           Optional<PrimExpr> partition_extent,
+                           bool iterate_full_buffer) const {
   int ndim = dst->shape.size();
+  bool region_is_full_buffer = true;
+  for (int axis = 0; axis < ndim; ++axis) {
+    region_is_full_buffer &=
+        analyzer->CanProveEqual(region[axis]->min, 0) &&
+        analyzer->CanProveEqual(region[axis]->extent, dst->shape[axis]);
+  }
+  if (iterate_full_buffer && !region_is_full_buffer) {
+    Array<IterVar> loop_vars;
+    Array<PrimExpr> dst_indices;
+    PrimExpr predicate = const_true();
+    for (int axis = 0; axis < ndim; ++axis) {
+      Var var = Var(std::string{char('i' + axis)}, dst->shape[axis].dtype());
+      loop_vars.push_back({Range::FromMinExtent(0, dst->shape[axis]), var,
+                           IterVarType::kDataPar});
+      dst_indices.push_back(var);
+      predicate = predicate && var >= region[axis]->min &&
+                  var < region[axis]->min + region[axis]->extent;
+    }
+    Stmt body = BufferStore(dst, value, dst_indices);
+    predicate = analyzer->Simplify(predicate);
+    if (!analyzer->CanProve(predicate)) {
+      body = IfThenElse(predicate, body);
+    }
+    for (int axis = ndim - 1; axis >= 0; --axis) {
+      body = For(loop_vars[axis]->var, 0, loop_vars[axis]->dom->extent,
+                 ForKind::kParallel, body);
+    }
+    return Downcast<For>(body);
+  }
+  if (partition_extent.defined()) {
+    PrimExpr element_count = make_const(DataType::Int(32), 1);
+    for (const Range &range : region) {
+      element_count *= cast(DataType::Int(32), range->extent);
+    }
+    PrimExpr threads = cast(DataType::Int(32), partition_extent.value());
+    if (!analyzer->CanProve(floormod(element_count, threads) == 0)) {
+      PrimExpr rounded_elements = analyzer->Simplify(
+          floordiv(element_count + threads - 1, threads) * threads);
+      Var linear_index("fill_index", DataType::Int(32));
+      PrimExpr remaining = linear_index;
+      std::vector<PrimExpr> dst_indices(ndim);
+      for (int axis = ndim - 1; axis >= 0; --axis) {
+        PrimExpr extent = cast(DataType::Int(32), region[axis]->extent);
+        dst_indices[axis] = region[axis]->min + floormod(remaining, extent);
+        remaining = floordiv(remaining, extent);
+      }
+      Stmt body = BufferStore(dst, value, Array<PrimExpr>(dst_indices));
+      body = IfThenElse(linear_index < element_count, body);
+      return For(linear_index, 0, rounded_elements, ForKind::kParallel, body);
+    }
+  }
   Array<IterVar> loop_vars;
   Array<PrimExpr> dst_indices;
   for (int i = 0; i < ndim; i++) {

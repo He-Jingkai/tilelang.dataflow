@@ -13,7 +13,7 @@ from . import overrides as _overrides  # noqa: F401
 # from .tir import prim_func, macro,  # noqa: F401
 from .eager import *  # noqa: F401
 from .tir.ir import *  # noqa: F401
-from tilelang.layout import Layout, Fragment  # noqa: F401
+from tilelang.layout import Fragment, Layout, make_wgmma_swizzled_layout  # noqa: F401
 from .proxy import ptr, make_tensor, make_tensor_from_addr, Buffer, Tensor, StridedTensor, FragmentBuffer, SharedBuffer, LocalBuffer  # noqa: F401
 from .loop import (
     Parallel,  # noqa: F401
@@ -55,11 +55,23 @@ from .allocate import (
     empty,  # noqa: F401
 )
 from tvm.script.parser.tir import allocate as allocate  # noqa: F401
-from .copy_op import copy, async_copy, tma_copy, transpose, c2d_im2col, copy_cluster  # noqa: F401
+from .copy_op import (  # noqa: F401
+    TransferSynchronizationOwner,
+    async_copy,
+    c2d_im2col,
+    copy,
+    copy_cluster,
+    tma_copy,
+    transfer_contract,
+    transpose,
+)
 from tilelang.tileop.base import GemmWarpPolicy  # noqa: F401
 from .gemm_op import (  # noqa: F401
+    gemm_contract,
     gemm,
     wgmma_gemm,
+    wgmma_gemm_local_p,
+    padded_wgmma_gemm,
     tcgen05_gemm,
     tcgen05_gemm_blockscaled,
     make_blockscaled_gemm_layout,
@@ -121,6 +133,7 @@ from .builtin import all_sync as all_sync  # noqa: F401
 from .builtin import ballot_sync as ballot_sync  # noqa: F401
 from .builtin import ballot as ballot  # noqa: F401
 from .builtin import activemask as activemask  # noqa: F401
+from .online_softmax import online_softmax_initialize, online_softmax_update  # noqa: F401
 from .builtin import syncthreads_count as syncthreads_count  # noqa: F401
 from .builtin import syncthreads_and as syncthreads_and  # noqa: F401
 from .builtin import syncthreads_or as syncthreads_or  # noqa: F401
@@ -148,11 +161,28 @@ from .pdl import (
     pdl_sync,  # noqa: F401
 )
 
+from . import dataflow as dataflow  # noqa: F401
+from .dataflow import (  # noqa: F401
+    dataflow_finalize,
+    dataflow_handoff_stage_count,
+    dataflow_intermediate,
+    dataflow_iter,
+    dataflow_map,
+    dataflow_next_task_coord,
+    dataflow_program,
+    dataflow_range_begin,
+    dataflow_range_end,
+    dataflow_range_tiles_per_handler,
+    dataflow_reduce,
+    dataflow_task_id,
+)
+
 from .cluster import (
     cluster_arrive_relaxed,  # noqa: F401
     cluster_arrive,  # noqa: F401
     cluster_wait,  # noqa: F401
     cluster_sync,  # noqa: F401
+    cluster_pull,  # noqa: F401
     block_rank_in_cluster,  # noqa: F401
     clc_try_cancel,  # noqa: F401
     clc_try_cancel_multicast,  # noqa: F401

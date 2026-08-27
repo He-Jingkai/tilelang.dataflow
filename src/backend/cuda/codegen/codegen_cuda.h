@@ -139,6 +139,15 @@ private:
   bool need_curand_kernel_h_{false};
   // whether need cluster.h
   bool need_cluster_h_{false};
+  // whether need Dataflow runtime helpers
+  bool need_dataflow_runtime_h_{false};
+  // Per-function Dataflow composition attributes. These are reset by
+  // AddFunction and keep wrapper specialization in lowered IR rather than in
+  // CUDA source rewrites.
+  std::optional<int64_t> dataflow_thread_limit_;
+  std::optional<int64_t> dataflow_partial_barrier_id_;
+  std::optional<int64_t> dataflow_dynamic_shared_offset_;
+  std::optional<int64_t> dataflow_dynamic_shared_alignment_;
   // Op attribute map
   OpAttrMap<bool> op_need_warp_shuffle_ =
       Op::GetAttrMap<bool>("cuda.need_warp_shuffle");

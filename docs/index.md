@@ -37,6 +37,8 @@ programming_guides/control_flow
 programming_guides/python_compatibility
 programming_guides/autotuning
 programming_guides/type_system
+dataflow/dataflow_manual/dataflow_frontend_api
+dataflow/dataflow_manual/dataflow_topology_probe
 :::
 
 :::{toctree}
@@ -56,6 +58,7 @@ deeplearning_operators/deepseek_mla
 
 compiler_internals/letstmt_inline
 compiler_internals/inject_fence_proxy
+compiler_internals/dataflow_cuda_runtime
 compiler_internals/tensor_checks
 :::
 

@@ -202,8 +202,8 @@ KERNEL_LAUNCH_FUNC_PY = """
     config.hStream = stream
     {11}
 
-    arg_values = {8}
-    arg_types = {9}
+    arg_values = tuple({8})
+    arg_types = tuple({9})
 
     res = cuLaunchKernelEx(config, kernels["{0}"], (arg_values, arg_types), 0)[0]
     if res != CUresult.CUDA_SUCCESS:

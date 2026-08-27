@@ -7,6 +7,7 @@ from tvm.runtime import Scriptable
 import tvm_ffi
 from .registry import resolve_gemm_impl
 from tilelang import _ffi_api
+from tilelang.utils.target import target_is_cuda
 
 
 @tvm_ffi.register_global_func("tl.gemm.infer_layout")
@@ -115,6 +116,10 @@ class Gemm(Node, Scriptable):
         return getattr(self, "isTcgen05", False)
 
     @property
+    def is_wgmma(self):
+        return getattr(self, "isWgmma", False)
+
+    @property
     def sf_a_id(self):
         return self.sfAId
 
@@ -149,8 +154,8 @@ class Gemm(Node, Scriptable):
         1. TCGEN5MMA for Blackwell architecture
         2. WGMMA for Hopper architecture with sufficient matrix size and warp count
         3. MFMA for CDNA (AMD) architecture
-        4. MMA for CUDA architecture
-        5. Scalar for CPU target (scalar fallback)
+        4. MMA for CUDA architecture when the shape satisfies MMA tile constraints
+        5. Scalar for CPU target or CUDA shapes that cannot use MMA
 
         Args:
             thread_nums: Number of threads in the block
@@ -159,7 +164,40 @@ class Gemm(Node, Scriptable):
         Returns:
             The selected backend-specific GEMM instruction key.
         """
+        if self.should_use_cuda_scalar_fallback(target):
+            return "cuda.scalar"
         return str(_ffi_api.GemmGetGemmInstructionKey(self, int(thread_nums), target))
+
+    def should_use_cuda_scalar_fallback(self, target: Target) -> bool:
+        if not target_is_cuda(target) or self.is_wgmma or self.is_tcgen05:
+            return False
+        try:
+            m_extent = int(self.M)
+            n_extent = int(self.N)
+            k_extent = int(self.K)
+        except (TypeError, ValueError):
+            return False
+        if m_extent >= 64:
+            return False
+        return not self.cuda_mma_tile_shape_supported(m_extent, n_extent, k_extent)
+
+    def cuda_mma_tile_shape_supported(self, m_extent: int, n_extent: int, k_extent: int) -> bool:
+        # The warp-level CUDA MMA emitter supports m16n8k{8,16,32,64,128,256}
+        # tiles. Hopper WGMMA still requires M >= 64, but M=16/32 should fall
+        # through to cuda.mma instead of the slow scalar fallback.
+        try:
+            input_bits = self.A.dtype.bits
+        except AttributeError:
+            return False
+        micro_k = min(256 // input_bits, k_extent)
+        return (
+            m_extent >= 16
+            and m_extent % 16 == 0
+            and n_extent >= 8
+            and n_extent % 8 == 0
+            and k_extent >= micro_k
+            and k_extent % micro_k == 0
+        )
 
     def _get_implementation_class(self, gemm_inst: str, target: Target):
         """Get the appropriate implementation class for the given GEMM instruction key.

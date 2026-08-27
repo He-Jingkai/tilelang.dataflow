@@ -10,9 +10,9 @@ from tilelang.utils.language import is_shared, is_fragment
 from tvm.script.ir_builder import IRBuilder
 
 
-def _legalize_dim(buffer: tir.Buffer, dim: int):
+def _legalize_dim(buffer: BufferLikeType, dim: int):
     if dim < 0:
-        dim = len(buffer.shape) + dim
+        dim = len(retrieve_shape(buffer)) + dim
     return dim
 
 
@@ -23,7 +23,13 @@ ReduceKind = Literal["sum", "abssum", "max", "absmax", "min", "bitand", "bitor",
 
 # NOTE(chaofan): T.reduce is implemented as a macro, so no return
 def reduce(
-    buffer: tir.Buffer, out: tir.Buffer, reduce_type: ReduceKind, dim: int, clear: bool, batch: int = 1, nan_propagate: bool = False
+    buffer: BufferLikeType,
+    out: BufferLikeType,
+    reduce_type: ReduceKind,
+    dim: int,
+    clear: bool,
+    batch: int = 1,
+    nan_propagate: bool = False,
 ) -> None:
     """Perform a reduction operation on a buffer along a specified dimension.
 
@@ -46,12 +52,14 @@ def reduce(
     if batch < 1:
         raise ValueError(f"batch must be >= 1, got {batch}")
     # input shape: [X, d, Y], expected output shape: [X, Y] or [X, 1, Y]
-    expected_shapes = [buffer.shape[:dim] + buffer.shape[dim + 1 :], buffer.shape[:dim] + [1] + buffer.shape[dim + 1 :]]
-    if list(out.shape) not in expected_shapes:
+    buffer_shape = list(retrieve_shape(buffer))
+    out_shape = list(retrieve_shape(out))
+    expected_shapes = [buffer_shape[:dim] + buffer_shape[dim + 1 :], buffer_shape[:dim] + [1] + buffer_shape[dim + 1 :]]
+    if out_shape not in expected_shapes:
         expected_shapes_str = " or ".join(map(str, expected_shapes))
         raise ValueError(
-            f"Invalid reduce output shape, buffer shape is {buffer.shape}, dim is {dim}, "
-            f"output shape is {out.shape}, expected shapes are {expected_shapes_str}"
+            f"Invalid reduce output shape, buffer shape is {buffer_shape}, dim is {dim}, "
+            f"output shape is {out_shape}, expected shapes are {expected_shapes_str}"
         )
 
     annotations = {}
@@ -65,12 +73,12 @@ def reduce(
     @macro
     def reduce_macro(buffer: tir.Buffer, out: tir.Buffer, reduce_type: str, dim: int, clear: bool) -> None:
         if is_shared(buffer) and is_shared(out):
-            red_frag_in = alloc_fragment(buffer.shape, buffer.dtype)
-            red_frag_out = alloc_fragment(out.shape, out.dtype)
+            red_frag_in = alloc_fragment(retrieve_shape(buffer), _get_buffer(buffer).dtype)
+            red_frag_out = alloc_fragment(retrieve_shape(out), _get_buffer(out).dtype)
 
             # rename buffers
-            IRBuilder.name(buffer.name + "_frag", red_frag_in)
-            IRBuilder.name(out.name + "_frag", red_frag_out)
+            IRBuilder.name(_get_buffer(buffer).name + "_frag", red_frag_in)
+            IRBuilder.name(_get_buffer(out).name + "_frag", red_frag_out)
 
             if not clear:
                 copy(out, red_frag_out)
@@ -88,8 +96,8 @@ def reduce(
             )
             copy(red_frag_out, out)
         elif is_shared(buffer) and is_fragment(out):
-            red_frag_in = alloc_fragment(buffer.shape, buffer.dtype)
-            IRBuilder.name(buffer.name + "_frag", red_frag_in)
+            red_frag_in = alloc_fragment(retrieve_shape(buffer), _get_buffer(buffer).dtype)
+            IRBuilder.name(_get_buffer(buffer).name + "_frag", red_frag_in)
 
             copy(buffer, red_frag_in)
             tir.call_intrin(
@@ -103,8 +111,8 @@ def reduce(
                 annotations=annotations,
             )
         elif is_fragment(buffer) and is_shared(out):
-            red_frag_out = alloc_fragment(out.shape, out.dtype)
-            IRBuilder.name(out.name + "_frag", red_frag_out)
+            red_frag_out = alloc_fragment(retrieve_shape(out), _get_buffer(out).dtype)
+            IRBuilder.name(_get_buffer(out).name + "_frag", red_frag_out)
 
             if not clear:
                 copy(out, red_frag_out)
@@ -137,7 +145,9 @@ def reduce(
     reduce_macro(buffer, out, reduce_type, dim, clear)
 
 
-def reduce_max(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True, batch: int = 1, nan_propagate: bool = False) -> None:
+def reduce_max(
+    buffer: BufferLikeType, out: BufferLikeType, dim: int = -1, clear: bool = True, batch: int = 1, nan_propagate: bool = False
+) -> None:
     """Perform reduce max on input buffer, store the result to output buffer
 
     Parameters
@@ -164,7 +174,9 @@ def reduce_max(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool =
     reduce(buffer, out, "max", dim, clear, batch=batch, nan_propagate=nan_propagate)
 
 
-def reduce_min(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True, batch: int = 1, nan_propagate: bool = False) -> None:
+def reduce_min(
+    buffer: BufferLikeType, out: BufferLikeType, dim: int = -1, clear: bool = True, batch: int = 1, nan_propagate: bool = False
+) -> None:
     """Perform reduce min on input buffer, store the result to output buffer.
 
     Args:
@@ -184,7 +196,7 @@ def reduce_min(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool =
     reduce(buffer, out, "min", dim, clear, batch=batch, nan_propagate=nan_propagate)
 
 
-def reduce_sum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True, batch: int = 1) -> None:
+def reduce_sum(buffer: BufferLikeType, out: BufferLikeType, dim: int = -1, clear: bool = True, batch: int = 1) -> None:
     """Perform reduce sum on input buffer, store the result to output buffer.
 
     Args:
@@ -210,7 +222,7 @@ def reduce_sum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool =
     reduce(buffer, out, "sum", dim, clear, batch=batch)
 
 
-def reduce_abssum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, batch: int = 1) -> None:
+def reduce_abssum(buffer: BufferLikeType, out: BufferLikeType, dim: int = -1, batch: int = 1) -> None:
     """Perform reduce absolute sum on input buffer, store the result to output buffer.
 
     Args:
@@ -227,7 +239,7 @@ def reduce_abssum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, batch: int
 
 
 def reduce_absmax(
-    buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True, batch: int = 1, nan_propagate: bool = False
+    buffer: BufferLikeType, out: BufferLikeType, dim: int = -1, clear: bool = True, batch: int = 1, nan_propagate: bool = False
 ) -> None:
     """Perform reduce absolute max on input buffer, store the result to output buffer.
 
@@ -247,7 +259,7 @@ def reduce_absmax(
     reduce(buffer, out, "absmax", dim, clear, batch=batch, nan_propagate=nan_propagate)
 
 
-def reduce_bitand(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True, batch: int = 1) -> None:
+def reduce_bitand(buffer: BufferLikeType, out: BufferLikeType, dim: int = -1, clear: bool = True, batch: int = 1) -> None:
     """Perform reduce bitwise-and on input buffer, store the result to output buffer.
 
     Args:
@@ -263,7 +275,7 @@ def reduce_bitand(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: boo
     reduce(buffer, out, "bitand", dim, clear, batch=batch)
 
 
-def reduce_bitor(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True, batch: int = 1) -> None:
+def reduce_bitor(buffer: BufferLikeType, out: BufferLikeType, dim: int = -1, clear: bool = True, batch: int = 1) -> None:
     """Perform reduce bitwise-or on input buffer, store the result to output buffer.
 
     Args:
@@ -279,7 +291,7 @@ def reduce_bitor(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool
     reduce(buffer, out, "bitor", dim, clear, batch=batch)
 
 
-def reduce_bitxor(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True, batch: int = 1) -> None:
+def reduce_bitxor(buffer: BufferLikeType, out: BufferLikeType, dim: int = -1, clear: bool = True, batch: int = 1) -> None:
     """Perform reduce bitwise-xor on input buffer, store the result to output buffer.
 
     Args:

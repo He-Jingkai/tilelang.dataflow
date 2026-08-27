@@ -63,10 +63,11 @@ def test_inject_set_max_nreg():
 
     script = mod.script()
     producer_branch = script.index("if v_2 >= 128:")
-    consumer_branch = script.index("else:", producer_branch)
     reg_dealloc = script.index("T.set_max_nreg(24, 0)")
     reg_alloc = script.index("T.set_max_nreg(240, 1)")
+    consumer_branch = script.rfind("if ", producer_branch, reg_alloc)
 
+    assert 'T.tvm_storage_sync("shared")' not in script
     assert producer_branch < reg_dealloc < consumer_branch
     assert consumer_branch < reg_alloc
 
@@ -103,6 +104,76 @@ def test_raw_set_max_nreg_keeps_legacy_behavior_with_simt_copy():
     assert script.count("T.set_max_nreg(80, 0)") == 1
     assert script.count("T.set_max_nreg(240, 1)") == 1
     assert script.count("T.set_max_nreg(") == 2
+
+
+def test_cross_handler_reg_handoff_normalizes_after_role_lifetimes():
+    @T.prim_func
+    def before(A: T.Tensor((256,), T.float16), B: T.Tensor((256,), T.float16)):
+        v = T.launch_thread("threadIdx.x", 256)
+
+        with T.block(""):
+            T.reads(A[0:256])
+            T.writes(B[0:256])
+            T.annotate_producer_reg_dealloc(40)
+            T.annotate_consumer_reg_alloc(232)
+            T.attr([128, 128], "kWarpSpecializationScope", 0)
+
+            if v >= 128:
+                B[v] = A[v]
+            else:
+                B[v] = A[v]
+
+    func = before.with_attr("tl.cross_handler_handoff_enabled", 1)
+    mod = tvm.IRModule.from_expr(func.with_attr("global_symbol", "main"))
+    mod = tl.transform.AnnotateWarpGroupRegAlloc()(mod)
+    mod = tir.transform.LowerOpaqueBlock()(mod)
+
+    script = mod.script()
+    producer_dealloc = script.index("T.set_max_nreg(40, 0)")
+    consumer_alloc = script.index("T.set_max_nreg(232, 1)")
+    producer_normalize = script.index("T.set_max_nreg(24, 0)")
+    consumer_normalize = script.index(
+        "T.set_max_nreg(24, 0)",
+        producer_normalize + 1,
+    )
+
+    assert script.count("T.set_max_nreg(24, 0)") == 2
+    assert 'T.tvm_storage_sync("shared")' not in script
+    assert producer_dealloc < producer_normalize < consumer_alloc < consumer_normalize
+
+
+def test_cross_handler_reg_handoff_does_not_repeat_minimum_producer_dealloc():
+    @T.prim_func
+    def before(A: T.Tensor((384,), T.float16), B: T.Tensor((384,), T.float16)):
+        v = T.launch_thread("threadIdx.x", 384)
+
+        with T.block(""):
+            T.reads(A[0:384])
+            T.writes(B[0:384])
+            T.annotate_producer_reg_dealloc(24)
+            T.annotate_consumer_reg_alloc(240)
+            T.attr([256, 128], "kWarpSpecializationScope", 0)
+
+            if v >= 256:
+                B[v] = A[v]
+            else:
+                B[v] = A[v]
+
+    func = before.with_attr("tl.cross_handler_handoff_enabled", 1)
+    mod = tvm.IRModule.from_expr(func.with_attr("global_symbol", "main"))
+    mod = tl.transform.AnnotateWarpGroupRegAlloc()(mod)
+    mod = tir.transform.LowerOpaqueBlock()(mod)
+
+    script = mod.script()
+    producer_dealloc = script.index("T.set_max_nreg(24, 0)")
+    consumer_alloc = script.index("T.set_max_nreg(240, 1)")
+    consumer_normalize = script.index(
+        "T.set_max_nreg(24, 0)",
+        producer_dealloc + 1,
+    )
+
+    assert script.count("T.set_max_nreg(24, 0)") == 2
+    assert producer_dealloc < consumer_alloc < consumer_normalize
 
 
 def test_inject_set_max_nreg_no_set_max_nreg():
@@ -184,9 +255,9 @@ def test_auto_ws_reg_hints_lower_into_matching_role_scopes():
         tl.enable_cache()
 
     producer_branch = src.index("if (128 <= ((int)threadIdx.x)) {")
-    consumer_branch = src.index("} else {", producer_branch)
     reg_dealloc = src.index("tl::warpgroup_reg_dealloc<40>();")
     reg_alloc = src.index("tl::warpgroup_reg_alloc<232>();")
+    consumer_branch = src.rfind("if (", producer_branch, reg_alloc)
 
     assert "warpgroup_reg_dealloc" not in src[:producer_branch]
     assert "warpgroup_reg_alloc" not in src[:producer_branch]

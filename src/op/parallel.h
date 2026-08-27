@@ -47,7 +47,7 @@ private:
 class ParallelOpNode : public TileOperatorNode {
 public:
   struct BufferAccessInfo {
-    Array<PrimExpr> indices;
+    std::vector<Array<PrimExpr>> index_sets;
     bool is_read = false;
     bool is_write = false;
   };
@@ -120,11 +120,14 @@ private:
   Fragment CompleteBufferFragment(const Buffer &buffer) const;
   // Check if the buffer is accessed with common indices (i.e., loop variables).
   bool IsCommonAccessIndice(const Buffer &buffer) const;
-  // Record buffer access and validate consistent indices.
+  // Record every distinct fragment access for later ownership validation.
   void RecordBufferAccess(const Buffer &buffer, const Array<PrimExpr> &indices,
                           bool is_write);
   // Access info lookup with validation.
   const BufferAccessInfo &GetAccessInfo(const Buffer &buffer) const;
+  // Return the first access map, used to seed layout inference. All other
+  // access maps are validated against the inferred layout before lowering.
+  const Array<PrimExpr> &GetPrimaryIndices(const Buffer &buffer) const;
   // Check if a buffer is completely replicated (all threads hold same data).
   bool IsBufferCompletelyReplicated(const Buffer &buffer,
                                     const LayoutMap &layout_map) const;

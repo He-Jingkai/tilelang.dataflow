@@ -1894,8 +1894,27 @@ private:
           }
         }
         ICHECK(prev_indice_bytes.dtype() == curr_indice_bytes.dtype());
-        provably_disjoint =
-            analyzer.CanProve(tir::NE(prev_indice_bytes, curr_indice_bytes));
+        // Prefer the deterministic interval proof before asking the symbolic
+        // prover.  Dynamic shared-memory buffers are coalesced to one backing
+        // allocation, so two logically distinct buffers commonly reach this
+        // point as scalar byte offsets with non-overlapping integer bounds.
+        // The symbolic prover is intentionally resource-limited and may
+        // conservatively return unknown for the same query depending on the
+        // surrounding solver state.  That used to make ThreadSync emit an
+        // unnecessary partial barrier in only some compilations of identical
+        // IR.  Integer bounds are sufficient for this common case and make
+        // the decision stable; retain the symbolic proof as the fallback for
+        // interleaved ranges whose bounds overlap.
+        auto prev_bound = analyzer.const_int_bound(prev_indice_bytes);
+        auto curr_bound = analyzer.const_int_bound(curr_indice_bytes);
+        if (prev_bound.defined() && curr_bound.defined() &&
+            (prev_bound->max_value < curr_bound->min_value ||
+             curr_bound->max_value < prev_bound->min_value)) {
+          provably_disjoint = true;
+        } else {
+          provably_disjoint =
+              analyzer.CanProve(tir::NE(prev_indice_bytes, curr_indice_bytes));
+        }
       } else {
         try {
           auto prev_min = analyzer.Simplify(

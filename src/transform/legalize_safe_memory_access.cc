@@ -393,6 +393,15 @@ private:
     return Optional<PrimExpr>();
   }
 
+  bool CPAsyncAssumesSourceInBounds(const Call &call) {
+    if (auto val = call->annotations.Get("assume_src_in_bounds")) {
+      if (const auto *int_val = val->as<IntImmNode>()) {
+        return int_val->value != 0;
+      }
+    }
+    return false;
+  }
+
   Stmt RewriteCPAsync(const Evaluate &evaluate, const Call &call,
                       const Array<PrimExpr> &conditions) {
     if (conditions.empty()) {
@@ -453,6 +462,9 @@ private:
     if (const CallNode *call_node = op->value.as<CallNode>()) {
       Call call = Downcast<Call>(op->value);
       if (call->op.as<OpNode>() && IsCPAsyncOp(Downcast<Op>(call->op))) {
+        if (CPAsyncAssumesSourceInBounds(call)) {
+          return evaluate;
+        }
         Array<PrimExpr> conditions = CollectCPAsyncConditions(call);
         if (conditions.empty()) {
           // Fallback when we cannot recover the underlying buffer access

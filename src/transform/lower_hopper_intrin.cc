@@ -148,7 +148,7 @@ public:
           Array<Stmt> stmt_seq;
           PrimExpr condition;
           if (!disable_shuffle_elect_) {
-            condition = Call(DataType::Bool(), tl_shuffle_elect(), {0});
+            condition = Call(DataType::Bool(), tl_shuffle_elect(), {op->value});
           } else {
             condition = EQ(iv->var, 0);
           }
