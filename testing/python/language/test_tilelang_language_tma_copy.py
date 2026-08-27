@@ -1,7 +1,8 @@
 """Test T.tma_copy() with user-managed synchronization.
 
 For TMA loads (global -> shared):
-  T.tma_copy() emits only expect_tx + tma_load (no arrive, no wait).
+  T.tma_copy() emits expect_tx + tma_load (no arrive, no wait) by default.
+  Prearmed callers can suppress the implicit expect_tx.
   The user must explicitly call T.barrier_arrive() and T.mbarrier_wait_parity().
   This allows multiple tma_copy operations to share a single barrier arrive.
   Pipeline buffer versioning expands the barrier to num_stages versions automatically.
@@ -96,6 +97,33 @@ def run_gemm_tma_copy(num_stages):
         return C.to(torch.__getattribute__(out_dtype))
 
     profiler.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
+
+
+def test_tma_copy_load_can_use_a_prearmed_barrier():
+    @T.prim_func
+    def main(
+        A: T.Tensor((64, 128), T.float8_e4m3fn),
+        B: T.Tensor((64, 128), T.float8_e4m3fn),
+    ):
+        with T.Kernel(1, threads=128):
+            A_shared = T.alloc_shared((64, 128), T.float8_e4m3fn)
+            loaded = T.alloc_barrier(128)
+            if T.shuffle_elect(128):
+                T.mbarrier_expect_tx(loaded, 64 * 128)
+            T.tma_copy(
+                A,
+                A_shared,
+                barrier=loaded,
+                expect_transaction=False,
+            )
+            T.mbarrier_arrive(loaded)
+            T.mbarrier_wait_parity(loaded, 0)
+            T.copy(A_shared, B)
+
+    source = tilelang.lower(main, target="cuda -arch=sm_90a").kernel_source
+
+    assert source.count(".expect_transaction(") == 1
+    assert "tl::tma_load" in source
 
 
 @tilelang.testing.requires_cuda

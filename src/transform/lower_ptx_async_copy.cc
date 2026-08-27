@@ -32,9 +32,11 @@ using namespace tir;
 class PTXAsyncCopyInjector : public StmtMutator {
 public:
   explicit PTXAsyncCopyInjector(bool enable_auto_async_copy,
-                                bool async_without_async_commit_wait)
+                                bool async_without_async_commit_wait,
+                                bool assume_src_in_bounds = false)
       : enable_auto_async_copy_(enable_auto_async_copy),
-        async_without_async_commit_wait_(async_without_async_commit_wait) {}
+        async_without_async_commit_wait_(async_without_async_commit_wait),
+        assume_src_in_bounds_(assume_src_in_bounds) {}
 
   bool InjectedPTXAsyncCopy() const { return injected_ptx_async_copy_; }
 
@@ -122,7 +124,7 @@ public:
           /*dst_base_load=*/BufferLoad(store->buffer, store->indices),
           /*src_base_load=*/BufferLoad(load->buffer, load->indices),
           /*num_elems=*/index_info->per_access_num_elems, predicated,
-          predicate_value);
+          predicate_value, assume_src_in_bounds_);
     }
 
     Optional<Array<PrimExpr>> src_base_indices =
@@ -143,7 +145,7 @@ public:
         /*dst_base_load=*/BufferLoad(store->buffer, dst_base_indices.value()),
         /*src_base_load=*/BufferLoad(load->buffer, src_base_indices.value()),
         /*num_elems=*/index_info->per_access_num_elems, predicated,
-        predicate_value);
+        predicate_value, assume_src_in_bounds_);
   }
 
   Stmt VisitStmt_(const SeqStmtNode *op) final {
@@ -480,19 +482,27 @@ private:
   }
 
   static PrimExpr MakeAccessPtrFromLoad(const BufferLoad &base_load, int extent,
-                                        int rw_mask) {
+                                        int rw_mask,
+                                        bool physical_offset = false) {
+    Map<String, ObjectRef> annotations;
+    if (physical_offset) {
+      annotations.Set(attr::kPhysicalOffsetAccessPtr,
+                      IntImm(DataType::Int(32), 1));
+    }
     return Call(DataType::Handle(), tvm::tl::access_ptr(),
                 {base_load, IntImm(DataType::Int(32), extent),
-                 IntImm(DataType::Int(32), rw_mask)});
+                 IntImm(DataType::Int(32), rw_mask)},
+                annotations);
   }
 
-  static Optional<Stmt>
-  MakeCPAsyncStmtFromLoads(const BufferStoreNode *store,
-                           const BufferLoad &dst_base_load,
-                           const BufferLoad &src_base_load, int num_elems,
-                           bool predicated, const PrimExpr &predicate_value) {
+  static Optional<Stmt> MakeCPAsyncStmtFromLoads(
+      const BufferStoreNode *store, const BufferLoad &dst_base_load,
+      const BufferLoad &src_base_load, int num_elems, bool predicated,
+      const PrimExpr &predicate_value, bool assume_src_in_bounds = false) {
     PrimExpr dst_access_ptr =
-        MakeAccessPtrFromLoad(dst_base_load, num_elems, /*rw_mask=*/2);
+        MakeAccessPtrFromLoad(dst_base_load, num_elems, /*rw_mask=*/2,
+                              /*physical_offset=*/
+                              IsSharedBuffer(dst_base_load->buffer));
     PrimExpr src_access_ptr =
         MakeAccessPtrFromLoad(src_base_load, num_elems, /*rw_mask=*/1);
 
@@ -503,8 +513,12 @@ private:
     } else {
       cp_async_args = {dst_access_ptr, src_access_ptr, PrimExpr(num_elems)};
     }
-    return Evaluate(
-        Call(store->buffer->dtype, tvm::tl::ptx_cp_async(), cp_async_args));
+    Map<String, ObjectRef> annotations;
+    if (assume_src_in_bounds) {
+      annotations.Set("assume_src_in_bounds", IntImm(DataType::Int(32), 1));
+    }
+    return Evaluate(Call(store->buffer->dtype, tvm::tl::ptx_cp_async(),
+                         cp_async_args, annotations));
   }
 
   static Stmt MakeCommitGroupStmt() {
@@ -687,6 +701,7 @@ private:
 
   bool enable_auto_async_copy_{true};
   bool async_without_async_commit_wait_{false};
+  bool assume_src_in_bounds_{false};
   int explicit_async_scope_depth_{0};
   int current_vectorized_lanes_{1};
   std::vector<ActiveVectorizedLoop> active_vectorized_loops_;
@@ -700,9 +715,11 @@ using namespace tir::transform;
 
 PTXAsyncCopyInjectResult
 InjectPTXAsyncCopy(const Stmt &body, bool enable_auto_async_copy,
-                   bool async_without_async_commit_wait) {
+                   bool async_without_async_commit_wait,
+                   bool assume_src_in_bounds) {
   PTXAsyncCopyInjector injector(enable_auto_async_copy,
-                                async_without_async_commit_wait);
+                                async_without_async_commit_wait,
+                                assume_src_in_bounds);
   Stmt injected = injector(body);
   return {injector.Finalize(injected), injector.InjectedPTXAsyncCopy()};
 }

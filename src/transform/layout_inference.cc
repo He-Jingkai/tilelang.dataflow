@@ -1095,6 +1095,7 @@ private:
       LayoutMap best_layout_map;
       int64_t min_reg_num = INT64_MAX;
       int min_reg_num_infer_root = -1;
+      std::vector<std::string> failed_attempts;
 
       // Try each member as the root of inference for this component
       for (int attempt_infer_root : members) {
@@ -1124,14 +1125,26 @@ private:
           }
         } catch (const LayoutConflictException &e) {
           do_update = false;
+          std::ostringstream os;
+          os << "root " << attempt_infer_root
+             << " LayoutConflictException: " << e.what();
+          failed_attempts.push_back(os.str());
           DLOG(INFO) << "attempt failed due to LayoutConflictException "
                      << e.what() << '\n';
         } catch (const NormalizeIterException &e) {
           do_update = false;
+          std::ostringstream os;
+          os << "root " << attempt_infer_root
+             << " NormalizeIterException: " << e.what();
+          failed_attempts.push_back(os.str());
           DLOG(INFO) << "attempt failed due to NormalizeIterException "
                      << e.what() << '\n';
         } catch (const LoopLayoutInjectiveException &e) {
           do_update = false;
+          std::ostringstream os;
+          os << "root " << attempt_infer_root
+             << " LoopLayoutInjectiveException: " << e.what();
+          failed_attempts.push_back(os.str());
           DLOG(INFO) << "attempt failed due to LoopLayoutInjectiveException "
                      << e.what() << '\n';
         }
@@ -1170,7 +1183,31 @@ private:
         // Restore infer_list_ state for the next attempt
         infer_list_ = std::move(back_infer_list);
       }
-      ICHECK(min_reg_num < INT64_MAX) << "no available layout found" << '\n';
+      if (min_reg_num == INT64_MAX) {
+        std::ostringstream os;
+        os << "no available layout found for component root " << root
+           << " with " << members.size() << " operators\n";
+        os << "operators:\n";
+        for (int member : members) {
+          os << "  [" << member << "] " << infer_list_stmt_[member] << "\n";
+          auto touched_it = op_touched_buffers_.find(member);
+          if (touched_it != op_touched_buffers_.end() &&
+              !touched_it->second.empty()) {
+            os << "      touched fragment buffers:";
+            for (const Buffer &buffer : touched_it->second) {
+              os << " " << buffer->name;
+            }
+            os << "\n";
+          }
+        }
+        if (!failed_attempts.empty()) {
+          os << "failed attempts:\n";
+          for (const auto &attempt : failed_attempts) {
+            os << "  - " << attempt << "\n";
+          }
+        }
+        LOG(FATAL) << os.str();
+      }
       // Apply the best plan for this component
       infer_list_ = std::move(best_infer_list);
       layout_map = best_layout_map;

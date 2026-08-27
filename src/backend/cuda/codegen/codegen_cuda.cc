@@ -486,6 +486,23 @@ void CodeGenTileLangCUDA::ReserveKeywordsAsUnique_() {
   name_supply_->ReserveName("yn");
 }
 
+namespace {
+
+bool IsDataflowDeviceFunction(const PrimFunc &func) {
+  auto attr = func->GetAttr<Integer>("tl.dataflow_device_function");
+  return attr.defined() && attr.value()->value != 0;
+}
+
+void PrintDataflowAwareFuncPrefix(const PrimFunc &func, std::ostream &os) {
+  if (IsDataflowDeviceFunction(func)) {
+    os << "__device__ __forceinline__ ";
+  } else {
+    os << "extern \"C\" __global__ ";
+  }
+}
+
+} // namespace
+
 void CodeGenTileLangCUDA::PrintFuncPrefix(std::ostream &os) {
   os << "extern \"C\" __global__ ";
 }
@@ -636,6 +653,9 @@ std::string CodeGenTileLangCUDA::Finish() {
 
   if (need_cluster_h_) {
     decl_stream << "#include <tl_templates/cuda/cluster.h>\n";
+  }
+  if (need_dataflow_runtime_h_) {
+    decl_stream << "#include <tl_templates/cuda/dataflow_runtime.h>\n";
   }
 
   if (need_curand_kernel_h_) {
@@ -1407,7 +1427,14 @@ void CodeGenTileLangCUDA::PrintStorageSync(const CallNode *op) {
   } else if (sync == "shared" || sync == "shared.dyn") {
     this->PrintIndent();
     if (args.size() == 1) {
-      this->stream << "__syncthreads();\n";
+      if (dataflow_thread_limit_.has_value()) {
+        ICHECK(dataflow_partial_barrier_id_.has_value());
+        this->stream << "tl::__sync_thread_partial<"
+                     << dataflow_partial_barrier_id_.value() << ", "
+                     << dataflow_thread_limit_.value() << ">();\n";
+      } else {
+        this->stream << "__syncthreads();\n";
+      }
     } else if (args.size() == 2) {
       ICHECK(args[1].dtype().is_int())
           << "storage_sync barrier_id must be integer type, got "
@@ -1460,7 +1487,14 @@ void CodeGenTileLangCUDA::PrintStorageSync(const CallNode *op) {
     this->PrintIndent();
     this->stream << "}\n";
     this->PrintIndent();
-    this->stream << "__syncthreads();\n";
+    if (dataflow_thread_limit_.has_value()) {
+      ICHECK(dataflow_partial_barrier_id_.has_value());
+      this->stream << "tl::__sync_thread_partial<"
+                   << dataflow_partial_barrier_id_.value() << ", "
+                   << dataflow_thread_limit_.value() << ">();\n";
+    } else {
+      this->stream << "__syncthreads();\n";
+    }
   }
 }
 
@@ -2404,9 +2438,16 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
     need_cluster_h_ = true;
     this->PrintIndent();
     this->stream << "tl::cluster_sync();\n";
+  } else if (op->op.same_as(tl::cluster_pull())) {
+    need_cluster_h_ = true;
+    ICHECK_EQ(op->args.size(), 6U);
+    print_extern_call_stmt("tl::cluster_pull");
   } else if (op->op.same_as(tl::block_rank_in_cluster())) {
     need_cluster_h_ = true;
     os << "tl::block_rank_in_cluster()";
+  } else if (op->op.same_as(tl::smid())) {
+    need_dataflow_runtime_h_ = true;
+    os << "tl::dataflow_smid()";
   } else if (op->op.same_as(tl::clc_try_cancel())) {
     need_cluster_h_ = true;
     print_extern_call_stmt("tl::clc_try_cancel");
@@ -4030,6 +4071,12 @@ bool CodeGenTileLangCUDA::HandleLateIntrinsicCall(const CallNode *op,
     os << func_name << "(" << PrintExpr(op->args[0]) << ", "
        << PrintExpr(op->args[1]) << ")";
     return true;
+  } else if (op->op.same_as(tl::fast_fdiv())) {
+    ICHECK(op->dtype.is_float() && op->dtype.bits() == 32)
+        << "tl.fast_fdiv only supports float32, but got " << op->dtype;
+    os << "__fdividef(" << PrintExpr(op->args[0]) << ", "
+       << PrintExpr(op->args[1]) << ")";
+    return true;
   } else if (op->op.same_as(tl::add2()) || op->op.same_as(tl::sub2()) ||
              op->op.same_as(tl::mul2()) || op->op.same_as(tl::fma2()) ||
              op->op.same_as(tl::max2()) || op->op.same_as(tl::min2()) ||
@@ -4329,6 +4376,22 @@ void CodeGenTileLangCUDA::VisitStmt_(const AllocateNode *op) {
   this->PrintIndent();
   std::string scope = GetPtrStorageScope(op->buffer_var);
   const VarNode *buffer = op->buffer_var.as<VarNode>();
+  if (scope == "shared.dyn" && dataflow_dynamic_shared_offset_.has_value()) {
+    ICHECK(dataflow_dynamic_shared_alignment_.has_value());
+    stream << "extern __shared__ __align__("
+           << dataflow_dynamic_shared_alignment_.value()
+           << ") uchar "
+              "dataflow_dynamic_shared[];\n";
+    PrintIndent();
+    PrintType(op->dtype, stream);
+    stream << " *" << vid << " = reinterpret_cast<";
+    PrintType(op->dtype, stream);
+    stream << " *>(dataflow_dynamic_shared + "
+           << dataflow_dynamic_shared_offset_.value() << "u);\n";
+    RegisterHandleType(op->buffer_var.get(), op->dtype);
+    this->PrintStmt(op->body);
+    return;
+  }
   if (scope.find("wmma.") == 0) {
     if (scope == "wmma.matrix_a" || scope == "wmma.matrix_b") {
       ICHECK(op->dtype == DataType::Float(16) ||
@@ -5234,7 +5297,7 @@ void CodeGenTileLangCUDA::PrintVecElemLoadExpr(DataType t, int i,
 void CodeGenTileLangCUDA::PrintFunctionSignature(const String &function_name,
                                                  const PrimFunc &func,
                                                  std::ostream &os) {
-  PrintFuncPrefix(os);
+  PrintDataflowAwareFuncPrefix(func, os);
   CodeGenC::PrintType(func->ret_type, os);
   CodeGenC::PrintExtraAttrs(func, os);
   bool no_alias = func->HasNonzeroAttr(tir::attr::kNoAlias);
@@ -5269,9 +5332,15 @@ void CodeGenTileLangCUDA::PrintFunctionSignature(const String &function_name,
       // work around for grid constant parameters.
       if (auto *ptr = v->type_annotation.as<PointerTypeNode>()) {
         if (ptr->storage_scope == "grid_constant") {
-          os << "__grid_constant__ const ";
-          CodeGenC::PrintType(ptr->element_type, os);
-          os << ' ' << vid;
+          if (IsDataflowDeviceFunction(func)) {
+            os << "const ";
+            CodeGenC::PrintType(ptr->element_type, os);
+            os << " &" << vid;
+          } else {
+            os << "__grid_constant__ const ";
+            CodeGenC::PrintType(ptr->element_type, os);
+            os << ' ' << vid;
+          }
           continue;
         }
       }
@@ -5315,6 +5384,33 @@ void CodeGenTileLangCUDA::PrintFunctionSignature(const String &function_name,
 
 void CodeGenTileLangCUDA::AddFunction(const GlobalVar &gvar,
                                       const PrimFunc &f) {
+  dataflow_thread_limit_.reset();
+  dataflow_partial_barrier_id_.reset();
+  dataflow_dynamic_shared_offset_.reset();
+  dataflow_dynamic_shared_alignment_.reset();
+  if (auto value = f->GetAttr<Integer>("tl.dataflow_thread_limit")) {
+    dataflow_thread_limit_ = value.value()->value;
+  }
+  if (auto value = f->GetAttr<Integer>("tl.dataflow_partial_barrier_id")) {
+    dataflow_partial_barrier_id_ = value.value()->value;
+  }
+  if (auto value = f->GetAttr<Integer>("tl.dataflow_dynamic_shared_offset")) {
+    dataflow_dynamic_shared_offset_ = value.value()->value;
+  }
+  if (auto value =
+          f->GetAttr<Integer>("tl.dataflow_dynamic_shared_alignment")) {
+    dataflow_dynamic_shared_alignment_ = value.value()->value;
+  }
+  if (dataflow_thread_limit_.has_value()) {
+    ICHECK_GT(dataflow_thread_limit_.value(), 0);
+    ICHECK(dataflow_partial_barrier_id_.has_value());
+    ICHECK_GE(dataflow_partial_barrier_id_.value(), 0);
+  }
+  if (dataflow_dynamic_shared_offset_.has_value()) {
+    ICHECK_GE(dataflow_dynamic_shared_offset_.value(), 0);
+    ICHECK(dataflow_dynamic_shared_alignment_.has_value());
+    ICHECK_GT(dataflow_dynamic_shared_alignment_.value(), 0);
+  }
   auto code_block_source = f->GetAttr<String>(tl::attr::kCodeBlockSource);
   if (code_block_source) {
     auto global_symbol = f->GetAttr<String>(tvm::attr::kGlobalSymbol);
@@ -5361,9 +5457,11 @@ void CodeGenTileLangCUDA::AddFunction(const GlobalVar &gvar,
     }
   }
 
-  this->PrintFuncPrefix(stream);
+  PrintDataflowAwareFuncPrefix(f, stream);
   CodeGenC::PrintType(f->ret_type, stream);
-  this->PrintExtraAttrs(f);
+  if (!IsDataflowDeviceFunction(f)) {
+    this->PrintExtraAttrs(f);
+  }
 
   // Record cluster dimensions for usage in threadblock swizzle codegen
   this->cluster_dims = ClusterInfoExtractor().extract(f);
@@ -5379,9 +5477,15 @@ void CodeGenTileLangCUDA::AddFunction(const GlobalVar &gvar,
       // work around for grid constant parameters.
       if (auto *ptr = v->type_annotation.as<PointerTypeNode>()) {
         if (ptr->storage_scope == "grid_constant") {
-          stream << "__grid_constant__ const ";
-          CodeGenC::PrintType(ptr->element_type, stream);
-          stream << ' ' << vid;
+          if (IsDataflowDeviceFunction(f)) {
+            stream << "const ";
+            CodeGenC::PrintType(ptr->element_type, stream);
+            stream << " &" << vid;
+          } else {
+            stream << "__grid_constant__ const ";
+            CodeGenC::PrintType(ptr->element_type, stream);
+            stream << ' ' << vid;
+          }
           continue;
         }
       }
@@ -5412,6 +5516,17 @@ void CodeGenTileLangCUDA::AddFunction(const GlobalVar &gvar,
   stream << ") {\n";
   this->PreFunctionBody(f);
   int func_scope = this->BeginScope();
+  if (dataflow_thread_limit_.has_value()) {
+    this->PrintIndent();
+    this->stream << "if (((int)threadIdx.x) >= "
+                 << dataflow_thread_limit_.value() << ") {\n";
+    int guard_scope = this->BeginScope();
+    this->PrintIndent();
+    this->stream << "return;\n";
+    this->EndScope(guard_scope);
+    this->PrintIndent();
+    this->stream << "}\n";
+  }
   this->PrintStmt(f->body);
   this->EndScope(func_scope);
   this->PrintIndent();

@@ -6,6 +6,8 @@
 #include "gemm.h"
 
 #include "builtin.h"
+#include <tvm/ffi/reflection/registry.h>
+#include <tvm/tir/analysis.h>
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/function.h>
 #include <tvm/tir/op.h>
@@ -13,12 +15,96 @@
 
 #include "utils.h"
 
+#include <algorithm>
+#include <sstream>
 #include <vector>
 
 namespace tvm {
 namespace tl {
 
 using namespace tir;
+
+GemmTemporaryRequirement MakeGemmTemporaryRequirement(
+    String buffer_role, String storage_scope, Array<Integer> logical_shape,
+    Array<Integer> physical_shape, PrimExpr neutral_value,
+    bool initialization_required, String lifetime_start, String lifetime_end,
+    int64_t estimated_bytes, int64_t additional_bytes) {
+  ObjectPtr<GemmTemporaryRequirementNode> node =
+      tvm::ffi::make_object<GemmTemporaryRequirementNode>();
+  node->buffer_role = std::move(buffer_role);
+  node->storage_scope = std::move(storage_scope);
+  node->logical_shape = std::move(logical_shape);
+  node->physical_shape = std::move(physical_shape);
+  node->neutral_value = std::move(neutral_value);
+  node->initialization_required = initialization_required;
+  node->lifetime_start = std::move(lifetime_start);
+  node->lifetime_end = std::move(lifetime_end);
+  node->estimated_bytes = estimated_bytes;
+  node->additional_bytes = additional_bytes;
+  return GemmTemporaryRequirement(std::move(node));
+}
+
+GemmLoweringPlan MakeGemmLoweringPlan(
+    String implementation_id, bool supported, bool synchronous,
+    Array<Integer> logical_shape, Array<Integer> physical_shape,
+    bool requires_padding, bool requires_materialization,
+    Array<GemmTemporaryRequirement> temporary_requirements,
+    int64_t additional_shared_memory_bytes, int64_t additional_fragment_bytes,
+    int64_t estimated_resource_bytes, String selection_reason,
+    Array<String> rejected_candidates) {
+  ObjectPtr<GemmLoweringPlanNode> node =
+      tvm::ffi::make_object<GemmLoweringPlanNode>();
+  node->implementation_id = std::move(implementation_id);
+  node->supported = supported;
+  node->synchronous = synchronous;
+  node->logical_shape = std::move(logical_shape);
+  node->physical_shape = std::move(physical_shape);
+  node->requires_padding = requires_padding;
+  node->requires_materialization = requires_materialization;
+  node->temporary_requirements = std::move(temporary_requirements);
+  node->additional_shared_memory_bytes = additional_shared_memory_bytes;
+  node->additional_fragment_bytes = additional_fragment_bytes;
+  node->estimated_resource_bytes = estimated_resource_bytes;
+  node->selection_reason = std::move(selection_reason);
+  node->rejected_candidates = std::move(rejected_candidates);
+  return GemmLoweringPlan(std::move(node));
+}
+
+const Op &GemmContract::Get() {
+  static const Op &op = Op::Get("tl.gemm_contract");
+  return op;
+}
+
+GemmContract::GemmContract(Array<PrimExpr> args) {
+  ICHECK_EQ(args.size(), 5)
+      << "tl.gemm_contract expects logical M/N/K, neutral padding value, "
+         "and allow_padding";
+  const int64_t *logical_m = as_const_int(args[0]);
+  const int64_t *logical_n = as_const_int(args[1]);
+  const int64_t *logical_k = as_const_int(args[2]);
+  const int64_t *allow_padding = as_const_int(args[4]);
+  ICHECK(logical_m != nullptr && logical_n != nullptr && logical_k != nullptr)
+      << "logical GEMM shape must be compile-time integers";
+  ICHECK_GT(*logical_m, 0);
+  ICHECK_GT(*logical_n, 0);
+  ICHECK_GT(*logical_k, 0);
+  ICHECK(allow_padding != nullptr &&
+         (*allow_padding == 0 || *allow_padding == 1))
+      << "allow_padding must be a compile-time bool";
+  ICHECK(args[3].dtype().is_scalar() && !args[3].dtype().is_handle())
+      << "logical GEMM neutral padding must be a scalar expression";
+  ICHECK_LE(SideEffect(args[3]), CallEffectKind::kPure)
+      << "logical GEMM neutral padding must be a pure scalar expression and "
+         "cannot read a buffer; pass a constant or scalar parameter";
+
+  ObjectPtr<GemmContractNode> node = tvm::ffi::make_object<GemmContractNode>();
+  node->logical_m = static_cast<int>(*logical_m);
+  node->logical_n = static_cast<int>(*logical_n);
+  node->logical_k = static_cast<int>(*logical_k);
+  node->padding_value = args[3];
+  node->allow_padding = *allow_padding != 0;
+  data_ = std::move(node);
+}
 
 namespace {
 
@@ -55,8 +141,16 @@ void RegisterGemmImpl(GemmImpl impl) {
   ICHECK(impl.compute_warp_partition != nullptr);
   ICHECK(impl.reuse_existing_shared_layout != nullptr);
   ICHECK(impl.instruction_kind != nullptr);
+  ICHECK(impl.resolve_lowering != nullptr);
   GemmImplRegistry().push_back(impl);
 }
+
+GemmLoweringPlan ResolveGemmLowering(const GemmNode &op,
+                                     const GemmLoweringContext &context) {
+  return ResolveGemmImpl(context.target).resolve_lowering(op, context);
+}
+
+int GemmLoweringRegistryVersion() { return kGemmLoweringPlanSchemaVersion; }
 
 /**
  * @brief Construct a Gemm operator from serialized TL arguments.
@@ -124,17 +218,48 @@ Gemm::Gemm(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
   }
   node->cCoords_ = Array<PrimExpr>(
       {args[17].as<PrimExpr>().value(), args[18].as<PrimExpr>().value()});
-  if (args.size() > 19) {
+  size_t semantic_arg_count = args.size();
+  for (size_t i = 19; i < args.size(); ++i) {
+    const auto *contract_call = args[i].as<CallNode>();
+    if (contract_call == nullptr) {
+      continue;
+    }
+    const auto *contract_op = contract_call->op.as<OpNode>();
+    if (contract_op == nullptr ||
+        !ffi::GetRef<Op>(contract_op).same_as(GemmContract::Get())) {
+      continue;
+    }
+    ICHECK(!node->gemm_contract.defined())
+        << "tl.gemm accepts at most one logical GEMM contract";
+    node->gemm_contract = GemmContract(contract_call->args);
+    semantic_arg_count = std::min(semantic_arg_count, i);
+  }
+  if (semantic_arg_count > 19) {
     node->sfaRegion_ = NormalizeToBufferRegion(args[19]);
   }
-  if (args.size() > 20) {
+  if (semantic_arg_count > 20) {
     node->sfbRegion_ = NormalizeToBufferRegion(args[20]);
   }
-  if (args.size() > 21) {
+  if (semantic_arg_count > 21) {
     node->sfAId_ = args[21].as<PrimExpr>().value();
   }
-  if (args.size() > 22) {
+  if (semantic_arg_count > 22) {
     node->sfBId_ = args[22].as<PrimExpr>().value();
+  }
+  if (node->gemm_contract.defined()) {
+    const GemmContract &contract = node->gemm_contract.value();
+    ICHECK_LE(contract->logical_m, node->m_)
+        << "logical GEMM M cannot exceed the operand region M";
+    ICHECK_LE(contract->logical_n, node->n_)
+        << "logical GEMM N cannot exceed the operand region N";
+    ICHECK_LE(contract->logical_k, node->k_)
+        << "logical GEMM K cannot exceed the operand region K";
+    ICHECK_EQ(contract->logical_n, node->n_)
+        << "logical GEMM materialization currently supports M padding only; "
+           "logical N must equal the operand region N";
+    ICHECK_EQ(contract->logical_k, node->k_)
+        << "logical GEMM materialization currently supports M padding only; "
+           "logical K must equal the operand region K";
   }
   node->annotations_ = annotations;
   data_ = std::move(node);
@@ -296,8 +421,17 @@ TVM_REGISTER_OP("tl.tileop.tcgen05_gemm")
 TVM_REGISTER_OP("tl.GemmWarpPolicy")
     .set_attr<TScriptPrinterName>("TScriptPrinterName", "GemmWarpPolicy");
 
+TVM_REGISTER_OP("tl.gemm_contract")
+    .set_num_inputs(5)
+    .set_attr<TScriptPrinterName>("TScriptPrinterName", "gemm_contract")
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kPure));
+
 TVM_FFI_STATIC_INIT_BLOCK() {
   GemmNode::RegisterReflection();
+  GemmContractNode::RegisterReflection();
+  GemmTemporaryRequirementNode::RegisterReflection();
+  GemmLoweringPlanNode::RegisterReflection();
   GemmWarpPolicyNode::RegisterReflection();
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef().def("tl.GemmWarpPolicyComputeWarpPartition",
@@ -306,11 +440,28 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                           policy->computeWarpPartition(M, N, block_size, target,
                                                        gemm_inst);
                         });
-  refl::GlobalDef().def("tl.GemmGetGemmInstructionKey",
-                        [](Gemm gemm, int block_size, Target target) {
-                          return gemm->getGemmInstructionKey(block_size,
-                                                             target);
-                        });
+  refl::GlobalDef()
+      .def("tl.GemmGetGemmInstructionKey",
+           [](Gemm gemm, int block_size, Target target) {
+             return gemm->getGemmInstructionKey(block_size, target);
+           })
+      .def("tl.ResolveGemmLowering",
+           [](Call call, Target target, int block_size,
+              int current_shared_memory_bytes, int max_shared_memory_bytes) {
+             TileOperator tile_op = ParseOperator(std::move(call));
+             const auto *gemm = tile_op.as<GemmNode>();
+             ICHECK(gemm != nullptr)
+                 << "tl.ResolveGemmLowering expects a GEMM tile-op call";
+             return ResolveGemmLowering(
+                 *gemm, GemmLoweringContext{target,
+                                            block_size,
+                                            {},
+                                            {},
+                                            current_shared_memory_bytes,
+                                            max_shared_memory_bytes});
+           })
+      .def("tl.GemmLoweringRegistryVersion",
+           []() { return Integer(GemmLoweringRegistryVersion()); });
 }
 
 } // namespace tl

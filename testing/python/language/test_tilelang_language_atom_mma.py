@@ -2,6 +2,7 @@ import torch
 import tilelang
 import tilelang.language as T
 import tilelang.testing
+from tvm import tir
 from tilelang.intrinsics import (
     TensorCoreIntrinEmitter,
     WGMMATensorCoreIntrinEmitter,
@@ -37,6 +38,48 @@ def infer_wgmma_shared_layout(continuity, dtype):
     if continuity % (vectorized_size * 2) == 0:
         return make_quarter_bank_swizzled_layout
     return make_linear_layout
+
+
+def test_wgmma_gran8_gate_up_pairs_have_identical_thread_ownership():
+    analyzer = tilelang.tvm.arith.Analyzer()
+    cases = (
+        ((64, 256), 64, 256, False),
+        ((512, 16), 512, 16, True),
+    )
+
+    for shape, warp_m, warp_n, interleave_m in cases:
+        accum = tir.decl_buffer(
+            shape,
+            "float32",
+            scope="local.fragment",
+            name="accum",
+        )
+        emitter = WGMMATensorCoreIntrinEmitter(
+            a_dtype="float8_e4m3fn",
+            b_dtype="float8_e4m3fn",
+            accum_dtype="float32",
+            a_transposed=False,
+            b_transposed=True,
+            block_row_warps=1,
+            block_col_warps=1,
+            warp_row_tiles=warp_m,
+            warp_col_tiles=warp_n,
+            chunk=128,
+            instruction_n=None if interleave_m else 128,
+        )
+        layout = emitter.make_mma_store_layout(accum)
+        logical_extent = shape[0] // 2 if interleave_m else shape[1] // 2
+        other_extent = shape[1] if interleave_m else shape[0]
+
+        for logical in range(logical_extent):
+            gate = (logical // 8) * 16 + logical % 8
+            up = gate + 8
+            for other in range(other_extent):
+                gate_indices = [gate, other] if interleave_m else [other, gate]
+                up_indices = [up, other] if interleave_m else [other, up]
+                gate_thread = analyzer.simplify(layout.map_forward_thread([tir.IntImm("int32", index) for index in gate_indices])[0])
+                up_thread = analyzer.simplify(layout.map_forward_thread([tir.IntImm("int32", index) for index in up_indices])[0])
+                assert int(gate_thread) == int(up_thread)
 
 
 # ---------------------------------------------------------------------------

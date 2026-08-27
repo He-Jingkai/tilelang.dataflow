@@ -674,6 +674,28 @@ def test_sync_hoist_non_uniform_if_in_loop():
 
 
 @tilelang.testing.requires_cuda
+def test_no_sync_for_disjoint_scalar_byte_ranges():
+    """Disjoint regions of one dynamic shared allocation do not conflict."""
+
+    @T.prim_func(private=True)
+    def func():
+        shared = T.alloc_buffer([1024], dtype="uint8", scope="shared")
+        result = T.alloc_buffer([1], dtype="uint8", scope="local")
+        bx = T.launch_thread("blockIdx.x", 1)
+        tx = T.launch_thread("threadIdx.x", 128)
+        ty = T.launch_thread("threadIdx.y", 1)
+        tz = T.launch_thread("threadIdx.z", 1)
+        result[0] = shared[tx]
+        if tx < 64:
+            shared[512 + tx] = result[0]
+
+    mod = tvm.IRModule({"main": func})
+    mod = tilelang.transform.ThreadSync("shared")(mod)
+    s = str(mod.script())
+    assert 'T.tvm_storage_sync("shared")' not in s, f"Unexpected sync:\n{s}"
+
+
+@tilelang.testing.requires_cuda
 def test_no_sync_needed_uniform_accesses():
     """Test that no extra sync is added when accesses are already safe.
 

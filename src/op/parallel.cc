@@ -146,12 +146,50 @@ void ParallelOpNode::ExpandLetBindings(
   if (let_var_to_expr.empty())
     return;
 
+  auto normalize_indices = [&](const Array<PrimExpr> &indices) {
+    Array<PrimExpr> normalized;
+    normalized.reserve(indices.size());
+    for (const PrimExpr &index : indices) {
+      PrimExpr current = index;
+      for (size_t depth = 0; depth <= let_var_to_expr.size(); ++depth) {
+        PrimExpr next = Substitute(current, let_var_to_expr);
+        if (StructuralEqual()(current, next))
+          break;
+        current = std::move(next);
+      }
+      normalized.push_back(std::move(current));
+    }
+    return normalized;
+  };
+
+  // The initial visitor runs before lowering supplies the surrounding let
+  // environment. Normalize those accesses first so layout inference never
+  // depends on whether an index happened to be written through a let alias.
+  for (auto &[buffer, access] : indice_map_) {
+    std::vector<Array<PrimExpr>> normalized_sets;
+    for (const auto &indices : access.index_sets) {
+      Array<PrimExpr> normalized = normalize_indices(indices);
+      bool duplicate = false;
+      for (const auto &existing : normalized_sets) {
+        if (StructuralEqual()(existing, normalized)) {
+          duplicate = true;
+          break;
+        }
+      }
+      if (!duplicate) {
+        normalized_sets.push_back(std::move(normalized));
+      }
+    }
+    access.index_sets = std::move(normalized_sets);
+  }
+
   // Helper function to recursively find BufferLoads through let bindings
   std::function<void(const PrimExpr &)> expand = [&](const PrimExpr &expr) {
     PostOrderVisit(expr, [&](const ObjectRef &node) {
       if (auto bl = node.as<BufferLoadNode>()) {
         if (IsFragmentBuffer(bl->buffer)) {
-          RecordBufferAccess(bl->buffer, bl->indices, /*is_write=*/false);
+          RecordBufferAccess(bl->buffer, normalize_indices(bl->indices),
+                             /*is_write=*/false);
         }
       } else if (auto var_node = node.as<VarNode>()) {
         auto var = tvm::ffi::GetRef<Var>(var_node);
@@ -183,13 +221,21 @@ void ParallelOpNode::RecordBufferAccess(const Buffer &buffer,
                                         const Array<PrimExpr> &indices,
                                         bool is_write) {
   auto it = indice_map_.find(buffer);
-  if (it != indice_map_.end()) {
-    ICHECK(StructuralEqual()(it->second.indices, indices))
-        << buffer << ": " << indices << " and " << it->second.indices;
-  } else {
+  if (it == indice_map_.end()) {
     BufferAccessInfo info;
-    info.indices = indices;
+    info.index_sets.push_back(indices);
     it = indice_map_.emplace(buffer, std::move(info)).first;
+  } else {
+    bool duplicate = false;
+    for (const auto &existing : it->second.index_sets) {
+      if (StructuralEqual()(existing, indices)) {
+        duplicate = true;
+        break;
+      }
+    }
+    if (!duplicate) {
+      it->second.index_sets.push_back(indices);
+    }
   }
   if (is_write) {
     it->second.is_write = true;
@@ -206,17 +252,27 @@ ParallelOpNode::GetAccessInfo(const Buffer &buffer) const {
   return it->second;
 }
 
+const Array<PrimExpr> &
+ParallelOpNode::GetPrimaryIndices(const Buffer &buffer) const {
+  const auto &access = GetAccessInfo(buffer);
+  ICHECK(!access.index_sets.empty())
+      << "Missing access indices for buffer " << buffer;
+  return access.index_sets.front();
+}
+
 bool ParallelOpNode::IsBufferCompletelyReplicated(
     const Buffer &buffer, const LayoutMap &layout_map) const {
   if (!IsFragmentBuffer(buffer))
     return false;
   auto frag = layout_map[buffer].as<Fragment>().value();
   // buffer indices should be IntImm
-  for (const auto &index : GetAccessInfo(buffer).indices) {
-    if (!index.as<IntImmNode>()) {
-      return false;
-    } else if (index.as<IntImmNode>()->value != 0) {
-      LOG(FATAL) << "buffer " << buffer << " is not completed replicated";
+  for (const auto &indices : GetAccessInfo(buffer).index_sets) {
+    for (const auto &index : indices) {
+      if (!index.as<IntImmNode>()) {
+        return false;
+      } else if (index.as<IntImmNode>()->value != 0) {
+        LOG(FATAL) << "buffer " << buffer << " is not completed replicated";
+      }
     }
   }
   return frag->IsCompletedReplicated();
@@ -231,7 +287,11 @@ Stmt ParallelOpNode::Lower(const LowerArgs &T,
 
 bool ParallelOpNode::IsCommonAccessIndice(const Buffer &buffer) const {
   auto common_indice = loop_vars_.Map([](const auto &iv) { return iv->var; });
-  return StructuralEqual()(GetAccessInfo(buffer).indices, common_indice);
+  for (const auto &indices : GetAccessInfo(buffer).index_sets) {
+    if (!StructuralEqual()(indices, common_indice))
+      return false;
+  }
+  return true;
 }
 
 /*! \brief Infer the layout for parallel operations based on different inference
@@ -278,18 +338,20 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &T,
 
       // Check if all indices are zero
       bool all_indices_zero = true;
-      for (const auto &index : access.indices) {
-        if (const auto *imm = index.as<IntImmNode>()) {
-          if (imm->value != 0) {
+      for (const auto &indices : access.index_sets) {
+        for (const auto &index : indices) {
+          if (const auto *imm = index.as<IntImmNode>()) {
+            if (imm->value != 0) {
+              all_indices_zero = false;
+              LOG(FATAL) << "Fragment buffer access with non-zero index ["
+                         << imm->value << "] is not supported. "
+                         << "Only fragment[0] access is allowed within "
+                            "T.Parallel loop.";
+            }
+          } else {
+            // Non-constant index, not all zero
             all_indices_zero = false;
-            LOG(FATAL)
-                << "Fragment buffer access with non-zero index [" << imm->value
-                << "] is not supported. "
-                << "Only fragment[0] access is allowed within T.Parallel loop.";
           }
-        } else {
-          // Non-constant index, not all zero
-          all_indices_zero = false;
         }
       }
 
@@ -325,11 +387,15 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &T,
     fragment_buffers.push_back(buffer);
 
     bool is_const_index = true;
-    for (const auto &index : access.indices) {
-      if (!index.as<IntImmNode>()) {
-        is_const_index = false;
-        break;
+    for (const auto &indices : access.index_sets) {
+      for (const auto &index : indices) {
+        if (!index.as<IntImmNode>()) {
+          is_const_index = false;
+          break;
+        }
       }
+      if (!is_const_index)
+        break;
     }
     if (is_const_index) {
       const_index_fragment_buffer.push_back(buffer);
@@ -373,8 +439,8 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &T,
         // if the buffer is completed replicated, we don't need to infer the
         // layout from this buffer.
         if ((!read_source_buffer.defined() ||
-             access.indices.size() >
-                 GetAccessInfo(read_source_buffer).indices.size())) {
+             GetPrimaryIndices(buffer).size() >
+                 GetPrimaryIndices(read_source_buffer).size())) {
           read_source_buffer = buffer;
         }
         // If the buffer is not replicated and shape is equal to the
@@ -487,6 +553,28 @@ LayoutMap ParallelOpNode::InferLayout(const LayoutInferArgs &T,
     if (!T.layout_map.count(buffer)) {
       auto dst_layout =
           CompleteBufferFragment(buffer)->BindThreadRange(T.thread_bounds);
+      auto vars =
+          loop_vars_.Map([](const IterVar &iv) { return PrimExpr(iv->var); });
+      for (const auto &indices : access.index_sets) {
+        const bool read_valid =
+            !access.is_read ||
+            ProveFragmentContains(loop_layout_, dst_layout, vars, indices,
+                                  analyzer_, false);
+        const bool write_valid =
+            !access.is_write ||
+            ProveFragmentContains(dst_layout, loop_layout_, indices, vars,
+                                  analyzer_, false);
+        if (!read_valid || !write_valid) {
+          std::ostringstream oss;
+          oss << "Inferred fragment layout does not support every access to "
+              << buffer << " in T.Parallel loop:" << '\n'
+              << "    primary access " << GetPrimaryIndices(buffer) << '\n'
+              << "    invalid access " << indices << '\n'
+              << "    loop " << loop_layout_->DebugOutput() << '\n'
+              << "    fragment " << dst_layout->DebugOutput() << '\n';
+          throw LayoutConflictException(oss.str());
+        }
+      }
       results.Set(buffer, dst_layout);
     }
   }
@@ -511,12 +599,12 @@ Fragment ParallelOpNode::CompleteBufferFragment(const Buffer &buffer) const {
   // them directly and avoid introducing a synthetic replicate dimension.
   {
     auto res2d =
-        arith::DetectIterMap(GetAccessInfo(buffer).indices, ToVMap(loop_vars_),
-                             1, arith::IterMapLevel::Bijective,
+        arith::DetectIterMap(GetPrimaryIndices(buffer), ToVMap(loop_vars_), 1,
+                             arith::IterMapLevel::Bijective,
                              const_cast<arith::Analyzer *>(&analyzer_));
     if (res2d->errors.empty()) {
       Layout ind_inv2d =
-          Layout(loop_vars_, GetAccessInfo(buffer).indices)->Inverse();
+          Layout(loop_vars_, GetPrimaryIndices(buffer))->Inverse();
       PrimExpr indice_rep_extent = 1;
       PrimExpr loop_rep_extent = loop_layout_->ReplicateExtent();
       PrimExpr dest_buffer_rep_extent = indice_rep_extent * loop_rep_extent;
@@ -533,9 +621,9 @@ Fragment ParallelOpNode::CompleteBufferFragment(const Buffer &buffer) const {
   }
   // Otherwise, infer an extra flattened iterator that captures truly-unused
   // pieces of the loop space (if any), then try inversion with it.
-  PrimExpr rep_b = MakeFlattenedExpression(DivideUnusedIterators(
-      GetAccessInfo(buffer).indices, loop_vars_, &analyzer_));
-  auto bijective_indice = GetAccessInfo(buffer).indices;
+  PrimExpr rep_b = MakeFlattenedExpression(
+      DivideUnusedIterators(GetPrimaryIndices(buffer), loop_vars_, &analyzer_));
+  auto bijective_indice = GetPrimaryIndices(buffer);
   bijective_indice.push_back(rep_b);
   Layout ind_inv = Layout(loop_vars_, bijective_indice)->Inverse();
 
@@ -572,27 +660,73 @@ bool ParallelOpNode::ValidateCandidateAgainstFragments(
     auto fragment = T.layout_map[buffer].as<Fragment>().value();
     std::ostringstream oss;
     bool success = true;
-    if (access.is_read &&
-        !ProveFragmentContains(candidate, fragment, vars, access.indices,
-                               analyzer_, check_forward_index)) {
-      if (throw_on_error) {
-        oss << "Layout infer conflict between " << buffer << " and "
-            << source_buffer << " in T.Parallel loop:" << '\n'
-            << "    loop " << candidate->DebugOutput() << '\n'
-            << "    fragment " << fragment->DebugOutput() << '\n';
+    const auto &primary_indices = access.index_sets.front();
+    auto has_primary_ownership = [&](const Array<PrimExpr> &indices) {
+      if (check_forward_index || StructuralEqual()(primary_indices, indices)) {
+        return StructuralEqual()(primary_indices, indices);
       }
-      success = false;
-    }
-    if (access.is_write &&
-        !ProveFragmentContains(fragment, candidate, access.indices, vars,
-                               analyzer_, check_forward_index)) {
-      if (throw_on_error) {
-        oss << "Layout infer conflict between " << buffer << " and "
-            << source_buffer << " in T.Parallel loop:" << '\n'
-            << "    loop " << candidate->DebugOutput() << '\n'
-            << "    fragment " << fragment->DebugOutput() << '\n';
+      Var rep("__parallel_multi_access_rep");
+      analyzer_.Bind(rep,
+                     Range(IntImm(fragment->ReplicateExtent()->dtype, 0),
+                           fragment->ReplicateExtent()),
+                     true);
+      PrimExpr primary_thread =
+          analyzer_.Simplify(fragment->ForwardThread(primary_indices, rep));
+      PrimExpr access_thread =
+          analyzer_.Simplify(fragment->ForwardThread(indices, rep));
+      if (analyzer_.CanProveEqual(primary_thread, access_thread))
+        return true;
+      return ProveFragmentContains(fragment, fragment, primary_indices, indices,
+                                   analyzer_, false) &&
+             ProveFragmentContains(fragment, fragment, indices, primary_indices,
+                                   analyzer_, false);
+    };
+    const bool primary_read_valid =
+        !access.is_read ||
+        ProveFragmentContains(candidate, fragment, vars, primary_indices,
+                              analyzer_, check_forward_index);
+    const bool primary_write_valid =
+        !access.is_write ||
+        ProveFragmentContains(fragment, candidate, primary_indices, vars,
+                              analyzer_, check_forward_index);
+    for (const auto &indices : access.index_sets) {
+      const bool same_thread_ownership = has_primary_ownership(indices);
+      const bool read_valid =
+          !access.is_read ||
+          (same_thread_ownership
+               ? primary_read_valid
+               : ProveFragmentContains(candidate, fragment, vars, indices,
+                                       analyzer_, check_forward_index));
+      if (!read_valid) {
+        if (throw_on_error) {
+          oss << "Layout infer conflict between " << buffer << " and "
+              << source_buffer << " in T.Parallel loop:" << '\n'
+              << "    primary access " << primary_indices << '\n'
+              << "    primary-equivalent " << same_thread_ownership << '\n'
+              << "    access " << indices << '\n'
+              << "    loop " << candidate->DebugOutput() << '\n'
+              << "    fragment " << fragment->DebugOutput() << '\n';
+        }
+        success = false;
       }
-      success = false;
+      const bool write_valid =
+          !access.is_write ||
+          (same_thread_ownership
+               ? primary_write_valid
+               : ProveFragmentContains(fragment, candidate, indices, vars,
+                                       analyzer_, check_forward_index));
+      if (!write_valid) {
+        if (throw_on_error) {
+          oss << "Layout infer conflict between " << buffer << " and "
+              << source_buffer << " in T.Parallel loop:" << '\n'
+              << "    primary access " << primary_indices << '\n'
+              << "    primary-equivalent " << same_thread_ownership << '\n'
+              << "    access " << indices << '\n'
+              << "    loop " << candidate->DebugOutput() << '\n'
+              << "    fragment " << fragment->DebugOutput() << '\n';
+        }
+        success = false;
+      }
     }
     if (!success) {
       if (throw_on_error) {
@@ -620,7 +754,7 @@ ParallelOpNode::ComputeLoopLayoutFromBuffer(const Buffer &buffer,
     auto rep_iter =
         IterVar({0, src_layout->ReplicateExtent()}, rep, IterVarType::kDataPar);
     PrimExpr loop_var_to_thread =
-        src_layout->ForwardThread(GetAccessInfo(buffer).indices, rep);
+        src_layout->ForwardThread(GetPrimaryIndices(buffer), rep);
     loop_var_to_thread = analyzer_.Simplify(loop_var_to_thread);
     PostOrderVisit(loop_var_to_thread, [&](const ObjectRef &objref) {
       if (auto opt_var = objref.as<Var>();

@@ -1198,6 +1198,9 @@ void CodeGenTileLangCuTeDSL::VisitExpr_(const CallNode *op,
     std::string rounding_mode = Downcast<StringImm>(op->args[2])->value;
     os << "tl.ieee_fdiv(" << PrintExpr_(op->args[0]) << ", "
        << PrintExpr_(op->args[1]) << ", rounding=\"" << rounding_mode << "\")";
+  } else if (op->op.same_as(tl::fast_fdiv())) {
+    os << "(" << PrintExpr_(op->args[0]) << " / " << PrintExpr_(op->args[1])
+       << ")";
   } else if (op->op.same_as(tl::warp_reduce_sum())) {
     os << "tl.warp_reduce_sum(" << PrintExpr_(op->args[0]) << ")";
   } else if (op->op.same_as(tl::warp_reduce_max())) {

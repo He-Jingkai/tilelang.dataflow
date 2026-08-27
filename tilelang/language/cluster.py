@@ -8,6 +8,7 @@ __all__ = [
     "cluster_arrive",
     "cluster_wait",
     "cluster_sync",
+    "cluster_pull",
     "block_rank_in_cluster",
     "clc_try_cancel",
     "clc_try_cancel_multicast",
@@ -42,6 +43,33 @@ def cluster_wait() -> tir.PrimExpr:
 def cluster_sync() -> tir.PrimExpr:
     """Issue cluster barrier arrive + wait (full synchronization)."""
     return tir.call_intrin("void", tir.op.Op.get("tl.cluster_sync"))
+
+
+def cluster_pull(
+    dst,
+    src,
+    src_rank,
+    size_bytes,
+    thread_start=0,
+    thread_count=128,
+) -> tir.PrimExpr:
+    """Cooperatively pull bytes from a peer CTA's DSM into local shared memory.
+
+    ``src`` denotes the address of the corresponding source allocation in the
+    calling CTA. The backend maps that address to ``src_rank`` in the cluster.
+    The selected contiguous thread group performs the copy; synchronization
+    between that producer group and consumers remains the caller's responsibility.
+    """
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.cluster_pull"),
+        _to_ptr(dst, "w"),
+        _to_ptr(src, "r"),
+        src_rank,
+        size_bytes,
+        thread_start,
+        thread_count,
+    )
 
 
 def block_rank_in_cluster() -> tir.PrimExpr:

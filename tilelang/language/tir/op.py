@@ -1509,6 +1509,25 @@ def ptx_ldmatrix(trans, num, src_access_ptr, dst_access_ptr):
     )
 
 
+def ptx_stmatrix(trans, num, dst_access_ptr, *values):
+    """TileLang intrinsic for ptx store matrix to shared memory.
+
+    Uses `tl.ptx_stmatrix` which expects the destination pointer to be created
+    via `T.access_ptr` or `T.tvm_access_ptr`, followed by the packed 32-bit
+    source registers accepted by the PTX stmatrix variant.
+
+    https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-instructions-stmatrix
+    """
+    return tvm.tir.call_intrin(
+        "handle",
+        tvm.tir.op.Op.get("tl.ptx_stmatrix"),
+        trans,
+        num,
+        dst_access_ptr,
+        *values,
+    )
+
+
 def ptx_cp_async(dst_access_ptr, src_access_ptr, num_elems, predicate=None):
     """TVM intrinsic for ptx async copy from global to shared memory using cp.async
     https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async

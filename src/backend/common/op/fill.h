@@ -22,7 +22,11 @@ struct Fill {
   static Stmt Lower(const FillNode &op, const LowerArgs &T,
                     arith::Analyzer *analyzer) {
     if (IsFragmentBuffer(op.dst)) {
-      auto par_op = ParallelOp(op.MakeSIMTLoop(analyzer));
+      auto par_op =
+          ParallelOp(op.predicated_partition
+                         ? op.MakeSIMTLoop(analyzer, T.thread_bounds->extent,
+                                           /*iterate_full_buffer=*/true)
+                         : op.MakeSIMTLoop(analyzer));
       par_op->InferLayout({T.target,
                            T.thread_bounds,
                            T.layout_map,
@@ -50,7 +54,10 @@ struct Fill {
     }
 
     if (IsSharedBuffer(op.dst) || IsGlobalBuffer(op.dst)) {
-      auto par_op = ParallelOp(op.MakeSIMTLoop(analyzer));
+      auto par_op =
+          ParallelOp(op.predicated_partition
+                         ? op.MakeSIMTLoop(analyzer, T.thread_bounds->extent)
+                         : op.MakeSIMTLoop(analyzer));
       par_op->InferLayout({T.target,
                            T.thread_bounds,
                            T.layout_map,

@@ -13,10 +13,51 @@ from tilelang.utils.language import (
     retrieve_stride,
     retrieve_offset,
     prim_expr_equal,
+    is_shared,
 )
 from tilelang.language.utils import (
     buffer_region_to_tile_region,
 )
+
+
+def gemm_contract(
+    logical_shape: tuple[int, int, int],
+    *,
+    padding_value: int | float | tir.PrimExpr = 0,
+    allow_padding: bool = True,
+) -> tir.Call:
+    """Create a target-independent logical GEMM shape contract."""
+
+    if not isinstance(logical_shape, tuple) or len(logical_shape) != 3:
+        raise TypeError(f"logical_shape must be a three-element (M, N, K) tuple, got {logical_shape!r}")
+    normalized_shape: list[tir.PrimExpr] = []
+    for name, extent in zip(("M", "N", "K"), logical_shape):
+        if isinstance(extent, bool) or not isinstance(extent, (int, tir.IntImm)):
+            raise TypeError(f"logical GEMM {name} must be a compile-time integer, got {extent!r}")
+        value = int(extent)
+        if value <= 0:
+            raise ValueError(f"logical GEMM {name} must be positive, got {value}")
+        normalized_shape.append(tir.const(value, "int32"))
+    if not isinstance(allow_padding, bool):
+        raise TypeError(f"allow_padding must be a bool, got {allow_padding!r}")
+    if not isinstance(padding_value, tir.PrimExpr):
+        if not isinstance(padding_value, (int, float)):
+            raise TypeError(f"padding_value must be a scalar, got {padding_value!r}")
+        padding_value = tir.const(padding_value)
+    padding_buffer_loads = []
+    tir.stmt_functor.post_order_visit(
+        padding_value,
+        lambda node: padding_buffer_loads.append(node) if isinstance(node, tir.BufferLoad) else None,
+    )
+    if padding_buffer_loads:
+        raise ValueError("padding_value cannot read a buffer; pass a constant or scalar parameter")
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.gemm_contract"),
+        *normalized_shape,
+        padding_value,
+        int(allow_padding),
+    )
 
 
 def _gemm_impl(
@@ -32,6 +73,9 @@ def _gemm_impl(
     wg_wait: int = 0,
     mbar: BarrierType | None = None,
     annotations: dict | None = None,
+    logical_shape: tuple[int, int, int] | None = None,
+    padding_value: int | float | tir.PrimExpr = 0,
+    allow_padding: bool = True,
 ) -> tir.PrimExpr:
     """Shared GEMM implementation.
 
@@ -101,8 +145,11 @@ def _gemm_impl(
 
     A_offset = retrieve_offset(A_region)
     B_offset = retrieve_offset(B_region)
-    assert A_offset[-2] == 0, "The offset of the first dimension of A must be 0"
-    assert B_offset[-2] == 0, "The offset of the first dimension of B must be 0"
+    if not prim_expr_equal(A_offset[-2], 0):
+        raise ValueError("The offset of the first dimension of A must be 0")
+    allow_wgmma_shared_b_row_offset = op_key == "tl.tileop.wgmma_gemm" and is_shared(B_region)
+    if not allow_wgmma_shared_b_row_offset and not prim_expr_equal(B_offset[-2], 0):
+        raise ValueError("The offset of the first dimension of B must be 0")
     offset_a = A_offset[-1]
     offset_b = B_offset[-1]
 
@@ -120,9 +167,7 @@ def _gemm_impl(
     # The C++ side checks if arg 16 is a BufferLoadNode before using it,
     # so a non-BufferLoad value will be correctly ignored.
     mbar_arg = mbar if mbar is not None else tir.const(0, dtype="int32")
-    return tir.call_intrin(
-        "handle",
-        tir.op.Op.get(op_key),
+    args = [
         A_arg,
         B_arg,
         C_arg,
@@ -142,6 +187,30 @@ def _gemm_impl(
         mbar_arg,
         C_coords[0],
         C_coords[1],
+    ]
+    if logical_shape is not None:
+        contract = gemm_contract(
+            logical_shape,
+            padding_value=padding_value,
+            allow_padding=allow_padding,
+        )
+        logical_m, logical_n, logical_k = (int(value) for value in logical_shape)
+        for name, logical, physical in (
+            ("M", logical_m, M),
+            ("N", logical_n, N),
+            ("K", logical_k, K),
+        ):
+            try:
+                physical_value = int(physical)
+            except (TypeError, ValueError):
+                physical_value = None
+            if physical_value is not None and logical > physical_value:
+                raise ValueError(f"logical GEMM {name}={logical} exceeds operand region extent {physical_value}")
+        args.append(contract)
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get(op_key),
+        *args,
         annotations=annotations,
     )
 
@@ -156,6 +225,10 @@ def gemm(
     clear_accum: bool = False,
     k_pack: int = 1,
     mbar: BarrierType | None = None,
+    *,
+    logical_shape: tuple[int, int, int] | None = None,
+    padding_value: int | float | tir.PrimExpr = 0,
+    allow_padding: bool = True,
 ) -> tir.PrimExpr:
     """TileLang GEMM operator.
 
@@ -179,6 +252,14 @@ def gemm(
         k_pack (int): Numbers of packed matrix cores, for ROCm only. Defaults to 1.
         mbar (BarrierType, i.e. Buffer | BufferLoad, or Var, optional): Mbarrier in Blackwell.
             Required when this GEMM lowers to TCGEN5MMA. Defaults to None.
+        logical_shape (tuple[int, int, int], optional): Logical M/N/K contract. A
+            target implementation may materialize a larger physical shape when
+            ``allow_padding`` is true. Defaults to the operand-region shape.
+        padding_value (int | float | tir.PrimExpr): Neutral value for
+            compiler-owned padding. Current WGMMA M-padding requires zero.
+        allow_padding (bool): Whether target lowering may materialize a larger
+            physical shape. If false, selection continues with an unpadded
+            implementation or fails closed when no legal candidate exists.
 
     Returns:
         tir.Call: A handle to the GEMM operation.
@@ -195,6 +276,9 @@ def gemm(
         k_pack,
         0,
         mbar,
+        logical_shape=logical_shape,
+        padding_value=padding_value,
+        allow_padding=allow_padding,
     )
 
 
@@ -206,6 +290,16 @@ def wgmma_gemm(
     transpose_B: bool = False,
     policy: GemmWarpPolicy = GemmWarpPolicy.Square,
     clear_accum: bool = False,
+    *,
+    emit_arrive: bool = True,
+    emit_commit: bool = True,
+    emit_fence_before: bool = True,
+    emit_fence_after: bool = True,
+    instruction_n: int | None = None,
+    logical_m: int | None = None,
+    logical_shape: tuple[int, int, int] | None = None,
+    padding_value: int | float | tir.PrimExpr = 0,
+    allow_padding: bool = True,
 ) -> tir.PrimExpr:
     """Explicit Hopper WGMMA GEMM without an implicit wait.
 
@@ -216,7 +310,42 @@ def wgmma_gemm(
 
     If the current target or operand pattern cannot use Hopper WGMMA,
     compilation fails instead of silently falling back to MMA.
+
+    ``logical_m`` is a convenience form of ``logical_shape``. Supplying either
+    opts into common logical-to-physical materialization; a call without a
+    logical contract retains the strict operand-region shape.
     """
+
+    if logical_m is not None:
+        if logical_shape is not None:
+            raise ValueError("logical_m and logical_shape are mutually exclusive")
+        if isinstance(logical_m, bool) or not isinstance(logical_m, int):
+            raise TypeError(f"logical_m must be an int, got {logical_m!r}")
+        if logical_m <= 0:
+            raise ValueError(f"logical_m must be positive, got {logical_m}")
+        A_region = to_buffer_region(A)
+        C_region = to_buffer_region(C)
+        A_shape = retrieve_shape(A_region)
+        C_shape = retrieve_shape(C_region)
+        logical_shape = (
+            logical_m,
+            int(C_shape[-1]),
+            int(A_shape[-2] if transpose_A else A_shape[-1]),
+        )
+
+    if instruction_n is not None:
+        if isinstance(instruction_n, bool) or not isinstance(instruction_n, int):
+            raise TypeError(f"instruction_n must be an int, got {instruction_n!r}")
+        if instruction_n < 8 or instruction_n > 256 or instruction_n % 8 != 0:
+            raise ValueError(f"instruction_n must be a multiple of 8 in [8, 256], got {instruction_n}")
+    annotations = {
+        "wgmma_emit_arrive": int(emit_arrive),
+        "wgmma_emit_commit": int(emit_commit),
+        "wgmma_emit_fence_before": int(emit_fence_before),
+        "wgmma_emit_fence_after": int(emit_fence_after),
+    }
+    if instruction_n is not None:
+        annotations["wgmma_instruction_n"] = instruction_n
 
     return _gemm_impl(
         "tl.tileop.wgmma_gemm",
@@ -230,6 +359,128 @@ def wgmma_gemm(
         1,
         -1,
         None,
+        annotations=annotations,
+        logical_shape=logical_shape,
+        padding_value=padding_value,
+        allow_padding=allow_padding,
+    )
+
+
+def wgmma_gemm_local_p(
+    A: BufferLikeType,
+    B: BufferLikeType,
+    C: BufferLikeType,
+    transpose_A: bool = False,
+    transpose_B: bool = False,
+    policy: GemmWarpPolicy = GemmWarpPolicy.Square,
+    clear_accum: bool = False,
+    *,
+    emit_arrive: bool = True,
+    emit_commit: bool = True,
+    emit_fence_before: bool = True,
+    emit_fence_after: bool = True,
+    logical_shape: tuple[int, int, int] | None = None,
+    padding_value: int | float | tir.PrimExpr = 0,
+    allow_padding: bool = True,
+) -> tir.PrimExpr:
+    """Explicit Hopper WGMMA RS for local-P fragments.
+
+    Local-P is the FlashMLA-style PV path where operand A is a half-precision
+    fragment produced from a QK accumulator fragment, then consumed directly by
+    register/shared WGMMA.  The A fragment must therefore keep the QK
+    accumulator layout instead of the normal WGMMA-RS A-load layout.
+    """
+    if transpose_A or transpose_B:
+        raise ValueError("T.wgmma_gemm_local_p local-P layout currently requires non-transposed operands")
+
+    return _gemm_impl(
+        "tl.tileop.wgmma_gemm",
+        A,
+        B,
+        C,
+        transpose_A,
+        transpose_B,
+        policy,
+        clear_accum,
+        1,
+        -1,
+        None,
+        annotations={
+            "wgmma_rs_a_is_local_p": 1,
+            "wgmma_emit_arrive": int(emit_arrive),
+            "wgmma_emit_commit": int(emit_commit),
+            "wgmma_emit_fence_before": int(emit_fence_before),
+            "wgmma_emit_fence_after": int(emit_fence_after),
+        },
+        logical_shape=logical_shape,
+        padding_value=padding_value,
+        allow_padding=allow_padding,
+    )
+
+
+def padded_wgmma_gemm(
+    A: BufferLikeType,
+    B: BufferLikeType,
+    C: BufferLikeType,
+    *,
+    logical_m: int,
+    physical_m: int = 64,
+    transpose_A: bool = False,
+    transpose_B: bool = False,
+    policy: GemmWarpPolicy = GemmWarpPolicy.Square,
+    clear_accum: bool = False,
+    emit_arrive: bool = True,
+    emit_commit: bool = True,
+    emit_fence_before: bool = True,
+    emit_fence_after: bool = True,
+) -> tir.PrimExpr:
+    """Explicit Hopper WGMMA for a logical-M tile padded to physical M=64.
+
+    Hopper WGMMA accumulator fragments are physically M=64.  This helper is an
+    explicit contract for kernels whose logical tile has fewer rows, such as
+    MLA decode with 32 query heads: callers allocate/pad A and C with
+    ``physical_m`` rows, issue WGMMA on the physical fragment, and consume only
+    the first ``logical_m`` rows.
+
+    This compatibility helper keeps caller-owned physical storage semantics.
+    New code can instead pass ``logical_m`` or ``logical_shape`` to
+    ``T.wgmma_gemm`` and let the common transform own physical materialization.
+    Explicit WGMMA still fails closed rather than falling back to ordinary MMA.
+    """
+    if isinstance(logical_m, bool) or not isinstance(logical_m, int):
+        raise TypeError(f"logical_m must be int, got {type(logical_m).__name__}")
+    if isinstance(physical_m, bool) or not isinstance(physical_m, int):
+        raise TypeError(f"physical_m must be int, got {type(physical_m).__name__}")
+    if logical_m <= 0:
+        raise ValueError(f"logical_m must be positive, got {logical_m}")
+    if physical_m != 64:
+        raise ValueError(f"padded_wgmma_gemm currently supports physical_m=64, got {physical_m}")
+    if logical_m > physical_m:
+        raise ValueError(f"logical_m={logical_m} must be <= physical_m={physical_m}")
+
+    A_region = to_buffer_region(A)
+    C_region = to_buffer_region(C)
+    A_shape = retrieve_shape(A_region)
+    C_shape = retrieve_shape(C_region)
+    A_m = A_shape[-1] if transpose_A else A_shape[-2]
+    C_m = C_shape[-2]
+    if not prim_expr_equal(A_m, physical_m):
+        raise ValueError(f"T.padded_wgmma_gemm A physical M must be {physical_m}, got {A_m}")
+    if not prim_expr_equal(C_m, physical_m):
+        raise ValueError(f"T.padded_wgmma_gemm C physical M must be {physical_m}, got {C_m}")
+
+    return wgmma_gemm(
+        A,
+        B,
+        C,
+        transpose_A=transpose_A,
+        transpose_B=transpose_B,
+        policy=policy,
+        clear_accum=clear_accum,
+        emit_arrive=emit_arrive,
+        emit_commit=emit_commit,
+        emit_fence_before=emit_fence_before,
+        emit_fence_after=emit_fence_after,
     )
 
 
